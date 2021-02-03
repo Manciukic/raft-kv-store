@@ -1,0 +1,4 @@
+-record(request_vote_req, {term, candidateId, lastLogIndex, lastLogTerm}).
+-record(request_vote_rpy, {term, voteGranted}).
+-record(append_entries_req, {term, leaderId, prevLogIndex, prevLogTerm, entries, leaderCommit}).
+-record(append_entries_rpy, {term, success, matchIndex}).
