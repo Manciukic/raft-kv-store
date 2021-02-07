@@ -15,28 +15,28 @@
 %%% RAFT API %%%
 commit_entry(Entry) ->
     logger:notice("(commit_entry) ~p~n", [Entry]),
-    gen_server:call(?MODULE, {commit_entry, Entry}, infinity).
+    gen_server:call(?MODULE, {sync, Entry}, infinity).
 
 %%% Client API %%%
 get(Key) ->
     logger:notice("(get) ~p~n", [Key]),
-    gen_server:call(?MODULE, {get, Key}, infinity).
+    gen_server:call(?MODULE, {execute, { get, Key }}, infinity).
 
 get_all() ->
     logger:notice("(get_all) ~n"),
-    gen_server:call(?MODULE, {get_all}, infinity).
+    gen_server:call(?MODULE, {execute, { get_all }}, infinity).
 
 set(Key, Value) ->
     logger:notice("(set) ~p:~p~n", [Key, Value]),
-    gen_server:call(?MODULE, { set, Key, Value }, infinity).
+    gen_server:call(?MODULE, {execute, { set, Key, Value } }, infinity).
 
 delete(Key) ->
     logger:notice("(delete) ~p~n", [Key]),
-    gen_server:call(?MODULE, {delete, Key}, infinity).
+    gen_server:call(?MODULE, {execute, { delete, Key }}, infinity).
 
 delete_all() ->
     logger:notice("(delete_all) ~n", []),
-    gen_server:call(?MODULE, {delete_all}, infinity).
+    gen_server:call(?MODULE, {execute, { delete_all }}, infinity).
 
 %%% Gen_server behaviour %%%
 start_link() ->
@@ -46,33 +46,36 @@ start_link() ->
 init(_Args) ->
     {ok, dict:new()}.
 
+handle_call({Type, Action}, _From, State) ->
+    case Action of
+        {get, Key} ->
+            Result = handle_get(Key, State),
+            {reply, Result, State};
+        {get_all} ->
+            Result = handle_get(State),
+            {reply, Result, State};
+        {set, Key, Value} ->
+            if Type == execute ->
+                raft_statem:add_entry(Action)
+            end,
+            NewState = handle_set(Key, Value, State),
+            {reply, ok, NewState};
+        {delete, Key} ->
+            if Type == execute ->
+                raft_statem:add_entry(Action)
+            end,
+            NewState = handle_delete(Key, State),
+            {reply, ok, NewState};
+        {delete_all} ->
+            if Type == execute ->
+                raft_statem:add_entry(Action)
+            end,
+            NewState = handle_delete(State),
+            {reply, ok, NewState};
+        _ -> {reply, error, State}
+    end.
 
-handle_call({commit_entry, Entry}, _From, State) ->
-    % NewState = set({set, Key, Value}, State),
-    {reply, ok, State};
-
-handle_call({get, Key}, _From, State) ->
-    Result = handle_get(Key, State),
-    {reply, Result, State};
-
-handle_call({get_all}, _From, State) ->
-    Result = handle_get(State),
-    {reply, Result, State};
-
-handle_call({set, Key, Value}, _From, State) ->
-    %raft_statem:add_entry({set, Key, Value}),
-    NewState = handle_set(Key, Value, State),
-    {reply, ok, NewState};
-
-handle_call({delete, Key}, _From, State) ->
-    NewState = handle_delete(Key, State),
-    {reply, ok, NewState};
-
-handle_call({delete_all}, _From, State) ->
-    NewState = handle_delete(State),
-    {reply, ok, NewState}.
-    
-handle_cast(Request, State) ->
+handle_cast(_, State) ->
     {noreply, State}.
 
 %%% GET %%%
