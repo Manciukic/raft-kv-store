@@ -56,19 +56,22 @@ handle_call({Type, Action}, _From, State) ->
             {reply, Result, State};
         {set, Key, Value} ->
             if Type == execute ->
-                raft_statem:add_entry(Action)
+                raft_statem:add_entry(Action);
+                true -> void
             end,
             NewState = handle_set(Key, Value, State),
             {reply, ok, NewState};
         {delete, Key} ->
             if Type == execute ->
-                raft_statem:add_entry(Action)
+                raft_statem:add_entry(Action);
+                true -> void
             end,
             NewState = handle_delete(Key, State),
             {reply, ok, NewState};
         {delete_all} ->
             if Type == execute ->
-                raft_statem:add_entry(Action)
+                raft_statem:add_entry(Action);
+                true -> void
             end,
             NewState = handle_delete(State),
             {reply, ok, NewState};
