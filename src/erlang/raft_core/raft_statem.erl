@@ -166,15 +166,8 @@ follower(cast, {request_vote, From, #request_vote_req{
     {keep_state, NewState,
         [{state_timeout, rand_election_timeout(), electionTimeout}]};
 
-follower({call, From}, get_leader, #state{leader=Leader}) ->
-    logger:debug("follower: get_leader: leader is ~p~n", [Leader]),
-    gen_statem:reply(From, Leader),
-    keep_state_and_data;
-
-follower({call, From}, {add_entry, _}, _State) ->
-    logger:debug("follower: add_entry: not a leader~n", []),
-    gen_statem:reply(From, false),
-    keep_state_and_data.
+follower(EventType, EventContent, Data) ->
+    handle_common(follower, EventType, EventContent, Data).
 
 
 candidate(state_timeout, electionTimeout, #state{
@@ -254,16 +247,8 @@ candidate(cast, {append_entries, _From, _Req}, State) ->
     logger:debug("candidate: append_entries: backing to follower~n", []),
     {next_state, follower, State, [postpone]};
 
-candidate({call, From}, get_leader, #state{leader=Leader}) ->
-    logger:debug("candidate: get_leader: leader is ~p~n", [Leader]),
-    gen_statem:reply(From, Leader),
-    keep_state_and_data;
-
-candidate({call, From}, {add_entry, _}, _State) ->
-    logger:debug("candidate: add_entry: not a leader~n", []),
-    gen_statem:reply(From, false),
-    keep_state_and_data.
-
+candidate(EventType, EventContent, Data) ->
+    handle_common(candidate, EventType, EventContent, Data).
 
 
 leader(state_timeout, heartBeatTimeout, State) ->
@@ -344,8 +329,31 @@ leader({call, From}, {add_entry, Entry}, #state{
     NewState=persist_entries([Entry], State),
     send_all_append_entries(NewState),
     NewPendingRequests = [{From, length(Log)+1} | PendingRequests],
-    {keep_state, NewState#state{pendingRequests=NewPendingRequests}}.
-    
+    {keep_state, NewState#state{pendingRequests=NewPendingRequests}};
+
+leader(EventType, EventContent, Data) ->
+    handle_common(leader, EventType, EventContent, Data).
+
+
+handle_common(State, {call, From}, get_leader, #state{leader=Leader}) ->
+    logger:debug("~p: get_leader: leader is ~p~n", [State]),
+    gen_statem:reply(From, Leader),
+    keep_state_and_data;
+
+handle_common(State, {call, From}, {add_entry, _}, _State) ->
+    logger:debug("~p: add_entry: not a leader~n", [State]),
+    gen_statem:reply(From, false),
+    keep_state_and_data;
+
+handle_common(State, cast, {Operation, _From, _Data}, _State) ->
+    logger:debug("~p: ~p: not allowed in this state~n", [State, Operation]),
+    keep_state_and_data;
+
+handle_common(State, EventType, _EventContent, _Data) ->
+    logger:debug("~p: event not handled: ~p~n", [State, EventType]),
+    keep_state_and_data.
+
+
 terminate(_Reason, _StateName, _State) ->
     logger:notice("(terminate) stopping~n", []),
     ok.
