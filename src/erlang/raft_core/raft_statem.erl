@@ -37,16 +37,140 @@
         ]).
 
 -include("raft_config.hrl").
--include("raft_interface.hrl").
 
 -define(SERVER, ?MODULE).
 
 % data held between states
 % TODO: use different records for each state to save memory ?
--record(state, {currentTerm, votedFor, log, commitIndex, lastApplied, nextIndex, matchIndex, electionTimeout, leader, votesFor, pendingRequests, nodes}).
+-record(state, {
+    % Persistent state on all servers
+    % (Updated on stable storage before responding to RPCs)
+    % TODO persist this data :D
+
+    % latest term server has seen 
+    % (initialized to 0 on first boot, increases monotonically)
+    current_term, 
+
+    % candidate_id that received vote in current term or null if none)
+    voted_for, 
+
+    % log entries; each entry contains command for state machine, and term 
+    % when entry was received by leader (first index is 1)
+    log, 
+
+    % Volatile state on all server
+
+    % index of highest log entry known to be committed (initialized to 0, 
+    % increases monotonically)
+    commit_index, 
+
+    % index of highest log entry applied to state machine 
+    % (initialized to 0, increases monotonically)
+    last_applied, 
+
+    % current known leader node
+    leader, 
+
+    % list of all other nodes
+    % (initialized at the beginning from configuration, removing local node)
+    nodes,
+
+    % Volatile state on leaders 
+    % (reinitialized after election)
+
+    % for each server, index of the next log entry to send to that server
+    % (initialized to leader last log index + 1)
+    % This is a map (key is node name, value is next_index)
+    next_index, 
+
+    % for each server, index of highest log entry known to be replicated 
+    % (initialized to 0, increases monotonically)
+    % This is a map (key is node name, value is next_index)
+    match_index, 
+
+    % list of client add_entry requests waiting for a reply
+    pending_requests, 
+
+    % Volatile state on candidates 
+    % (reinitialized at new election)
+
+    % set of nodes that have voted for this node
+    votes_for
+}).
 
 % structure of a log entry
--record(log_entry, {term, content}).
+-record(log_entry, {
+    % the term this entry has been added
+    term, 
+
+    % the content of the log entry, containing the command to the FSM
+    content
+}).
+
+% request_vote RPC
+% Invoked by candidates to gather votes
+
+% arguments of request_vote RPC
+-record(request_vote_req, {
+    % candidate's term
+    term, 
+
+    % candidate requesting vote, aka node(self())
+    candidate_id, 
+
+    % index of candidate's last log entry
+    last_log_index, 
+
+    % term of candidate's last log entry
+    last_log_term
+}).
+
+% results of request_vote RPC
+-record(request_vote_rpy, {
+    % current_term, for candidate to update itself
+    term, 
+
+    % true means candidate received vote
+    vote_granted
+}).
+
+% append_entries RPC
+% Invoked by leader to replicate log entries; also used as heartbeat
+
+% arguments of append_entries RPC
+-record(append_entries_req, {
+    % leader's term
+    term, 
+
+    % so follower can redirect clients
+    leader_id, 
+
+    % index of log entry immediately preceding new ones
+    prev_log_index, 
+
+    % term of prev_log_index entry
+    prev_log_term, 
+
+    % list of log entrues to store
+    % (empty for heartbeat; may send more than one for efficiency)
+    entries, 
+
+    % leader's commit_index
+    leader_commit
+}).
+
+% results of append_entries RPC
+-record(append_entries_rpy, {
+    % current_term, for leader to update itself
+    term, 
+
+    % true if follower contained entry matching prev_log_index 
+    % and prev_log_term
+    success, 
+
+    % prev_log_index, so leaders can match replies with requests
+    match_index
+}).
 
 %%%===================================================================
 %%% API
@@ -112,15 +236,15 @@ init([]) ->
     % TODO load persisted data from disk
 
     {ok, follower, #state{
-        currentTerm=0, 
-        votedFor=null, 
+        current_term=0, 
+        voted_for=null, 
         log=[], 
-        commitIndex=0, 
-        lastApplied=0, 
-        nextIndex=maps:new(),
-        matchIndex=maps:new(),
+        commit_index=0, 
+        last_applied=0, 
+        next_index=maps:new(),
+        match_index=maps:new(),
         leader=null,
-        pendingRequests=[],
+        pending_requests=[],
         nodes=lists:delete(node(self()), ?NODES)
     },
     [{state_timeout, rand_election_timeout(), electionTimeout}]}.
@@ -178,10 +302,10 @@ follower(state_timeout, electionTimeout, #state{}=State) ->
 % check validity and add the new entries from the log and reply to the leader
 follower(cast, {append_entries, From, #append_entries_req{
     term=Term,
-    prevLogIndex=PrevLogIndex, 
-    prevLogTerm=PrevLogTerm
+    prev_log_index=PrevLogIndex, 
+    prev_log_term=PrevLogTerm
 }=Req}, #state{
-    currentTerm=CurrentTerm,
+    current_term=CurrentTerm,
     log=Log
 } = State) ->
     NewState = if 
@@ -190,9 +314,9 @@ follower(cast, {append_entries, From, #append_entries_req{
             reply_append_entries(From, CurrentTerm, false, 0),
             State;
         PrevLogIndex > length(Log) -> % local log is out-of-sync, signal it
-            logger:debug("follower: append_entries: prevLogIndex not in log (~p)~n", [PrevLogIndex]),
+            logger:debug("follower: append_entries: prev_log_index not in log (~p)~n", [PrevLogIndex]),
             reply_append_entries(From, Term, false, length(Log)),
-                                 State#state{currentTerm=Term};
+                                 State#state{current_term=Term};
         true -> 
             NthLogTerm = nth_log_entry_term(PrevLogIndex, Log),
             if
@@ -200,7 +324,7 @@ follower(cast, {append_entries, From, #append_entries_req{
                     % entry is incompatible with local log, deny it
                     logger:debug("follower: append_entries: wrong nth log term~n", []),
                     reply_append_entries(From, Term, false, PrevLogIndex),
-                    State#state{currentTerm=Term};
+                    State#state{current_term=Term};
                 true -> % ok
                     logger:debug("follower: append_entries: ok~n", []),
                     NewState_ = do_append_entries(Req, State),
@@ -216,12 +340,12 @@ follower(cast, {append_entries, From, #append_entries_req{
 % check if candidate log is updated and reply to its vote request
 follower(cast, {request_vote, From, #request_vote_req{
     term = Term, 
-    candidateId = CandidateId, 
-    lastLogIndex = LastLogIndex, 
-    lastLogTerm = LastLogTerm
+    candidate_id = CandidateId, 
+    last_log_index = LastLogIndex, 
+    last_log_term = LastLogTerm
 }}, #state{
-    currentTerm = CurrentTerm,
-    votedFor = VotedFor,
+    current_term = CurrentTerm,
+    voted_for = VotedFor,
     log = Log
 } = State) ->
     NewState = if
@@ -232,7 +356,7 @@ follower(cast, {request_vote, From, #request_vote_req{
         (VotedFor == null) or (VotedFor == CandidateId) ->
             % no vote casted or repeated request_vote
             % update current term
-            NewState_ = State#state{currentTerm=max(CurrentTerm,Term)},
+            NewState_ = State#state{current_term=max(CurrentTerm,Term)},
             {MyLastLogIndex, MyLastLogTerm} = last_log_index_term(Log),
             if 
                 MyLastLogIndex > 0 -> % log is not empty
@@ -243,14 +367,14 @@ follower(cast, {request_vote, From, #request_vote_req{
                             logger:debug("follower: request_vote: voting for ~p (higher term)~n", [CandidateId]),
                             reply_request_vote(From, CurrentTerm, true),
                             % remember who I voted for
-                            NewState_#state{votedFor=CandidateId};
+                            NewState_#state{voted_for=CandidateId};
                         (LastLogTerm == MyLastLogTerm) and (LastLogIndex >= MyLastLogIndex) ->
                             % leader log is more updated than mine, vote for 
                             % him
                             logger:debug("follower: request_vote: voting for ~p (higher index)~n", [CandidateId]),
                             reply_request_vote(From, CurrentTerm, true),
                             % remember who I voted for
-                            NewState_#state{votedFor=CandidateId};
+                            NewState_#state{voted_for=CandidateId};
                         true -> % leader log is out-dated, deny vote
                             logger:debug("follower: request_vote: outdated log~n", []),
                             reply_request_vote(From, CurrentTerm, false),
@@ -260,7 +384,7 @@ follower(cast, {request_vote, From, #request_vote_req{
                     logger:debug("follower: request_vote: voting for ~p (empty log)~n", [CandidateId]),
                     reply_request_vote(From, CurrentTerm, true),
                     % remember who I voted for
-                    NewState_#state{votedFor=CandidateId}
+                    NewState_#state{voted_for=CandidateId}
             end;
         true -> % already voted, deny vote
             logger:debug("follower: request_vote: voted already~n", []),
@@ -282,15 +406,15 @@ follower(EventType, EventContent, Data) ->
 
 % not enough replies within time, start a new election
 candidate(state_timeout, electionTimeout, #state{
-    currentTerm=CurrentTerm,
+    current_term=CurrentTerm,
     log=Log,
     nodes=Nodes
 }=State) ->
     logger:info("candidate: starting election~n", []),
     NewState = State#state{
-        currentTerm=CurrentTerm+1, % TODO check
-        votedFor=node(self()),
-        votesFor=sets:from_list([node(self())])
+        current_term=CurrentTerm+1, % TODO check
+        voted_for=node(self()),
+        votes_for=sets:from_list([node(self())])
     },
     {LastLogIndex, LastLogTerm} = last_log_index_term(Log),
     % request votes from all other nodes
@@ -303,10 +427,10 @@ candidate(state_timeout, electionTimeout, #state{
 % reply from other node
 candidate(cast, {request_vote_rpy, From, #request_vote_rpy{
     term=Term,
-    voteGranted=VoteGranted
+    vote_granted=VoteGranted
 }}, #state{
-    votesFor=VotesFor,
-    currentTerm=CurrentTerm,
+    votes_for=VotesFor,
+    current_term=CurrentTerm,
     log=Log,
     nodes=Nodes
 }=State) ->
@@ -322,38 +446,38 @@ candidate(cast, {request_vote_rpy, From, #request_vote_rpy{
                     {LastLogIndex, _LastLogTerm} = last_log_index_term(Log),
                     {next_state, leader, State#state{
                             leader=node(self()),
-                            nextIndex=maps:from_list([
+                            next_index=maps:from_list([
                                 {Node, LastLogIndex+1}
                                 || Node <- Nodes
                             ]),
-                            matchIndex=maps:from_list([
+                            match_index=maps:from_list([
                                 {Node, 0}
                                 || Node <- Nodes
                             ]),
-                            pendingRequests=[]   
+                            pending_requests=[]   
                         }, 
                         % send heartbeat to notify election end
                         [{state_timeout, 0, heartBeatTimeout}]
                     };
                 true -> % not enough votes, update state and wait
                     logger:debug("candidate: request_vote_rpy: not enough votes (~p)~n", [NVotes]),
-                    {keep_state, State#state{votesFor=NewVotesFor}}
+                    {keep_state, State#state{votes_for=NewVotesFor}}
             end;
         true -> % candidate has been rejected
             logger:debug("candidate: request_vote_rpy: vote rejected from ~p~n", [node(From)]),
-            {keep_state, State#state{currentTerm=max(Term,CurrentTerm)}}
+            {keep_state, State#state{current_term=max(Term,CurrentTerm)}}
     end;
 
 % receive a request to vote from another candidate
 candidate(cast, {request_vote, From, #request_vote_req{
     term=Term
-}}, #state{currentTerm=CurrentTerm}=State) ->
+}}, #state{current_term=CurrentTerm}=State) ->
     if 
         Term > CurrentTerm -> % his term is higher, vote for him
             logger:debug("candidate: request_vote: term is higher~n", []),
             {next_state, follower, State#state{
-                currentTerm=Term,
-                votedFor=null
+                current_term=Term,
+                voted_for=null
             }, 
             % request_vote handled in follower state
             [postpone]};
@@ -391,15 +515,15 @@ leader(state_timeout, heartBeatTimeout, State) ->
 leader(cast, {append_entries_rpy, From, #append_entries_rpy{
     term=Term, 
     success=Success,
-    matchIndex=MatchIndex}
+    match_index=MatchIndex}
 }, #state{
-    currentTerm=CurrentTerm,
-    nextIndex=NextIndexMap,
-    matchIndex=MatchIndexMap,
-    commitIndex=CommitIndex,
+    current_term=CurrentTerm,
+    next_index=NextIndexMap,
+    match_index=MatchIndexMap,
+    commit_index=CommitIndex,
     log=Log,
-    pendingRequests=PendingRequests,
-    lastApplied=LastApplied
+    pending_requests=PendingRequests,
+    last_applied=LastApplied
 }=State) ->
     Node = node(From),
     NewState = if
@@ -410,8 +534,8 @@ leader(cast, {append_entries_rpy, From, #append_entries_rpy{
             % this should not happen in practice
             logger:debug("leader: append_entries_rpy: newer term, backing off~n", []),
             {next_state, follower, State#state{
-                currentTerm=Term,
-                votedFor=null
+                current_term=Term,
+                voted_for=null
             }, [postpone]};
         Success ->  
             % append_entries was successfull, update internal view of follower
@@ -423,11 +547,11 @@ leader(cast, {append_entries_rpy, From, #append_entries_rpy{
             % if so, do those commits
             NewPendingRequests = do_commit_entries(LastApplied+1, NewCommitIndex, Log, PendingRequests),
             State#state{
-                nextIndex=NewNextIndexMap,
-                matchIndex=NewMatchIndexMap,
-                commitIndex=NewCommitIndex,
-                lastApplied=NewCommitIndex,
-                pendingRequests=NewPendingRequests
+                next_index=NewNextIndexMap,
+                match_index=NewMatchIndexMap,
+                commit_index=NewCommitIndex,
+                last_applied=NewCommitIndex,
+                pending_requests=NewPendingRequests
             };
         true -> % Success is false
             OldNextIndex = maps:get(Node, NextIndexMap),
@@ -441,7 +565,7 @@ leader(cast, {append_entries_rpy, From, #append_entries_rpy{
                     NewNextIndexMap = maps:put(Node, OldNextIndex-1, 
                                                 NextIndexMap),
                     NewState_ = State#state{
-                        nextIndex=NewNextIndexMap
+                        next_index=NewNextIndexMap
                     },
                     send_append_entries(node(From), NewState_),
                     NewState_
@@ -451,14 +575,14 @@ leader(cast, {append_entries_rpy, From, #append_entries_rpy{
 
 % add the new entry to the log and send append entries to all other nodes
 leader({call, From}, {add_entry, Entry}, #state{
-    pendingRequests=PendingRequests,
+    pending_requests=PendingRequests,
     log=Log
 }=State) ->
     logger:debug("leader: add_entry~n", []),
     NewState=persist_entries([Entry], State),
     send_all_append_entries(NewState),
     NewPendingRequests = [{From, length(Log)+1} | PendingRequests],
-    {keep_state, NewState#state{pendingRequests=NewPendingRequests}, [
+    {keep_state, NewState#state{pending_requests=NewPendingRequests}, [
         % reset heartbeat timeout
         {state_timeout, ?HEART_BEAT_TIMEOUT, heartBeatTimeout}
     ]};
@@ -518,32 +642,32 @@ terminate(_Reason, _StateName, _State) ->
 
 % request votes from all other nodes
 request_votes(Nodes, Term, CandidateId, LastLogIndex, LastLogTerm) ->
-    logger:debug("(request_votes) term=~p, candidate=~p, lastLogIndex=~p, lastLogTerm=~p~n", [Term, CandidateId, LastLogIndex, LastLogTerm]),
+    logger:debug("(request_votes) term=~p, candidate=~p, last_log_index=~p, last_log_term=~p~n", [Term, CandidateId, LastLogIndex, LastLogTerm]),
     send_all(Nodes, {request_vote, self(), #request_vote_req{
             term=Term, 
-            candidateId=CandidateId, 
-            lastLogIndex=LastLogIndex, 
-            lastLogTerm=LastLogTerm
+            candidate_id=CandidateId, 
+            last_log_index=LastLogIndex, 
+            last_log_term=LastLogTerm
         }}).
 
 %%--------------------------------------------------------------------
 
 % send heartbeat to all other nodes
 send_heartbeat(#state{
-    currentTerm=CurrentTerm,
-    commitIndex=CommitIndex,
+    current_term=CurrentTerm,
+    commit_index=CommitIndex,
     log=Log,
     nodes=Nodes
 }) -> 
     {LastLogIndex, LastLogTerm} = last_log_index_term(Log),
-    logger:debug("(send_heartbeat) term=~p, commitIndex=~p, lastLogIndex=~p, lastLogTerm=~p~n", [CurrentTerm, CommitIndex, LastLogIndex, LastLogTerm]),
+    logger:debug("(send_heartbeat) term=~p, commit_index=~p, last_log_index=~p, last_log_term=~p~n", [CurrentTerm, CommitIndex, LastLogIndex, LastLogTerm]),
     send_all(Nodes, {append_entries, self(), #append_entries_req{
         term=CurrentTerm, 
-        leaderId=node(self()), 
-        prevLogIndex=LastLogIndex, 
-        prevLogTerm=LastLogTerm, 
+        leader_id=node(self()), 
+        prev_log_index=LastLogIndex, 
+        prev_log_term=LastLogTerm, 
         entries=[], 
-        leaderCommit=CommitIndex
+        leader_commit=CommitIndex
     }}).
 
 %%--------------------------------------------------------------------
@@ -574,24 +698,24 @@ send_all_append_entries([HNode | TNodes], State) ->
 % The message should contain all log entries that the leader believes
 % the follower not to know about (through the next_index map).
 send_append_entries(Node, #state{
-    nextIndex=NextIndexMap,
-    commitIndex=CommitIndex,
-    currentTerm=CurrentTerm,
+    next_index=NextIndexMap,
+    commit_index=CommitIndex,
+    current_term=CurrentTerm,
     log=Log
 }) ->
     NextIndex = maps:get(Node, NextIndexMap),
     PrevLogIndex = max(0, NextIndex-1),
     PrevLogTerm = nth_log_entry_term(PrevLogIndex, Log),
-    logger:debug("(send_append_entries) node=~p, term=~p, prevLogIndex=~p, prevLogTerm=~p leaderCommit=~p~n", [Node, CurrentTerm, PrevLogIndex, PrevLogTerm, CommitIndex]),
+    logger:debug("(send_append_entries) node=~p, term=~p, prev_log_index=~p, prev_log_term=~p leader_commit=~p~n", [Node, CurrentTerm, PrevLogIndex, PrevLogTerm, CommitIndex]),
 
     gen_statem:cast({?SERVER, Node}, {append_entries, self(), 
         #append_entries_req{
             term=CurrentTerm, 
-            leaderId=node(self()), 
-            prevLogIndex=PrevLogIndex, 
-            prevLogTerm=PrevLogTerm, 
+            leader_id=node(self()), 
+            prev_log_index=PrevLogIndex, 
+            prev_log_term=PrevLogTerm, 
             entries=log_sublist(Log, NextIndex), 
-            leaderCommit=CommitIndex
+            leader_commit=CommitIndex
         }
     }).
 
@@ -604,7 +728,7 @@ reply_append_entries(To, Term, Success, MatchIndex) ->
         #append_entries_rpy{
             term=Term,
             success=Success,
-            matchIndex=MatchIndex
+            match_index=MatchIndex
         }
     }).
     
@@ -612,10 +736,10 @@ reply_append_entries(To, Term, Success, MatchIndex) ->
 
 % reply to a request_vote request
 reply_request_vote(To, Term, VoteGranted) ->
-    logger:debug("(reply_request_vote) node=~p, term=~p, voteGranted=~p~n", [To, Term, VoteGranted]),
+    logger:debug("(reply_request_vote) node=~p, term=~p, vote_granted=~p~n", [To, Term, VoteGranted]),
     gen_statem:cast({?SERVER, node(To)}, {request_vote_rpy, self(), #request_vote_rpy{
         term=Term,
-        voteGranted=VoteGranted
+        vote_granted=VoteGranted
     }}).
 
 %%--------------------------------------------------------------------
@@ -625,19 +749,19 @@ reply_request_vote(To, Term, VoteGranted) ->
 % add the new entries to the log and commit any uncommitted entries
 do_append_entries(#append_entries_req{
     term=Term,
-    leaderId=Leader, 
-    prevLogIndex=PrevLogIndex,  
+    leader_id=Leader, 
+    prev_log_index=PrevLogIndex,  
     entries=Entries, 
-    leaderCommit=LeaderCommit
+    leader_commit=LeaderCommit
 }, #state{
-    commitIndex=CommitIndex,
+    commit_index=CommitIndex,
     log=Log,
-    lastApplied=LastApplied
+    last_applied=LastApplied
 }=State) ->
     case Entries of
         [] ->
             pass;
-        _ -> logger:info("(do_append_entries) prevLogIndex=~p, size(entries)=~p~n", [PrevLogIndex, length(Entries)])
+        _ -> logger:info("(do_append_entries) prev_log_index=~p, size(entries)=~p~n", [PrevLogIndex, length(Entries)])
     end,
     % build new log, overwriting any conflicting entry
     NewLog = lists:sublist(Log, PrevLogIndex+1) ++ Entries,
@@ -654,10 +778,10 @@ do_append_entries(#append_entries_req{
     do_commit_entries(LastApplied+1, NewCommitIndex, NewLog, []),
     State#state{
         leader=Leader,
-        commitIndex=NewCommitIndex,
+        commit_index=NewCommitIndex,
         log=NewLog,
-        currentTerm=Term,
-        lastApplied=NewCommitIndex
+        current_term=Term,
+        last_applied=NewCommitIndex
     }.
 
 %%--------------------------------------------------------------------
@@ -747,7 +871,7 @@ acknowledge_request(CommitIndex, Requests) ->
 %%--------------------------------------------------------------------
 
 % Reply to pending FSM add_entry RPCs (internal).
-% Check all pending requests and reply if index == commitIndex.
+% Check all pending requests and reply if index == commit_index.
 
 acknowledge_request(_CommitIndex, [], NewPendingRequests, Handled) -> 
     {Handled, NewPendingRequests};
@@ -771,7 +895,7 @@ acknowledge_request(CommitIndex, [HRequest | TRequests], NewPendingRequests, Han
 % TODO: this is only done in leader, not in follower!
 persist_entries(Entries, #state{
     log=Log,
-    currentTerm=CurrentTerm
+    current_term=CurrentTerm
 }=State) ->
     NewLogEntries = [#log_entry{
         term=CurrentTerm,
@@ -849,4 +973,3 @@ rand_election_timeout() ->
 % return the required quorum for the given nodes
 quorum() ->
     floor((length(?NODES))/2+1).
-    
