@@ -107,8 +107,8 @@
     content
 }).
 
-% request_vote RPC
-% Invoked by candidates to gather votes
+%% request_vote RPC
+%% Invoked by candidates to gather votes
 
 % arguments of request_vote RPC
 -record(request_vote_req, {
@@ -134,8 +134,8 @@
     vote_granted
 }).
 
-% append_entries RPC
-% Invoked by leader to replicate log entries; also used as heartbeat
+%% append_entries RPC
+%% Invoked by leader to replicate log entries; also used as heartbeat
 
 % arguments of append_entries RPC
 -record(append_entries_req, {
@@ -299,45 +299,83 @@ follower(state_timeout, electionTimeout, #state{}=State) ->
         [{state_timeout, 0, electionTimeout}]
     };
 
-% check validity and add the new entries from the log and reply to the leader
+%% apend_entries RPC
+%% check validity and add the new entries from the log and reply to the leader
+
+% reply false if term < current_term
+follower(cast, {append_entries, From, #append_entries_req{
+    term=Term
+}}, #state{
+    current_term=CurrentTerm
+} = State) 
+when Term < CurrentTerm ->
+    logger:debug("follower: append_entries: old term~n", []),
+    reply_append_entries(From, CurrentTerm, false, 0),
+    % reset the election timeout
+    {keep_state, State, 
+        [{state_timeout, rand_election_timeout(), electionTimeout}]};
+
+% reply false if log doesn't contain an entry at prev_log_index
+% i.e. local log is out-of-sync, signal it to leader
+follower(cast, {append_entries, From, #append_entries_req{
+    term=Term,
+    prev_log_index=PrevLogIndex
+}}, #state{
+    log=Log
+} = State)
+when PrevLogIndex > length(Log) -> 
+    logger:debug("follower: append_entries: prev_log_index not in log (~p)~n", 
+                [PrevLogIndex]),
+    reply_append_entries(From, Term, false, length(Log)),
+    % reset the election timeout
+    {keep_state, State#state{current_term=Term}, 
+        [{state_timeout, rand_election_timeout(), electionTimeout}]};
+
+% reply false if log doesn't contain an entry at prev_log_index whose
+% term matches prev_log_term, otherwise append the entry
 follower(cast, {append_entries, From, #append_entries_req{
     term=Term,
     prev_log_index=PrevLogIndex, 
     prev_log_term=PrevLogTerm
 }=Req}, #state{
-    current_term=CurrentTerm,
     log=Log
 } = State) ->
-    NewState = if 
-        Term < CurrentTerm -> % the request is from an older term, deny it
-            logger:debug("follower: append_entries: old term~n", []),
-            reply_append_entries(From, CurrentTerm, false, 0),
-            State;
-        PrevLogIndex > length(Log) -> % local log is out-of-sync, signal it
-            logger:debug("follower: append_entries: prev_log_index not in log (~p)~n", [PrevLogIndex]),
-            reply_append_entries(From, Term, false, length(Log)),
-                                 State#state{current_term=Term};
-        true -> 
-            NthLogTerm = nth_log_entry_term(PrevLogIndex, Log),
-            if
-                PrevLogTerm =/= NthLogTerm -> 
-                    % entry is incompatible with local log, deny it
-                    logger:debug("follower: append_entries: wrong nth log term~n", []),
-                    reply_append_entries(From, Term, false, PrevLogIndex),
-                    State#state{current_term=Term};
-                true -> % ok
-                    logger:debug("follower: append_entries: ok~n", []),
-                    NewState_ = do_append_entries(Req, State),
-                    #state{log=NewLog} = NewState_,
-                    reply_append_entries(From, Term, true, length(NewLog)),
-                    NewState_
-            end
+    NthLogTerm = nth_log_entry_term(PrevLogIndex, Log),
+    NewState = if
+        PrevLogTerm =/= NthLogTerm -> 
+            % entry is incompatible with local log, deny it
+            logger:debug("follower: append_entries: wrong nth log term~n", []),
+            reply_append_entries(From, Term, false, PrevLogIndex),
+            State#state{current_term=Term};
+        true -> % ok
+            logger:debug("follower: append_entries: ok~n", []),
+            NewState2 = do_append_entries(Req, State),
+            #state{log=NewLog} = NewState2,
+            reply_append_entries(From, Term, true, length(NewLog)),
+            NewState2
     end,
     % reset the election timeout
     {keep_state, NewState, 
         [{state_timeout, rand_election_timeout(), electionTimeout}]};
 
-% check if candidate log is updated and reply to its vote request
+%% request_vote RPC
+%% check if candidate log is updated and reply to its vote request
+
+% reply false if term < current_term
+follower(cast, {request_vote, From, #request_vote_req{
+    term = Term
+}}, #state{
+    current_term = CurrentTerm
+} = State)
+when Term < CurrentTerm -> 
+    logger:debug("follower: request_vote: wrong term~n", []),
+    reply_request_vote(From, CurrentTerm, false),
+    % reset election timeout
+    {keep_state, State,
+        [{state_timeout, rand_election_timeout(), electionTimeout}]};
+      
+% if voted_for is null or candidate_id, and candidate's log is at least 
+% as up-to-date as receiver's log, grant vote
 follower(cast, {request_vote, From, #request_vote_req{
     term = Term, 
     candidate_id = CandidateId, 
@@ -347,53 +385,34 @@ follower(cast, {request_vote, From, #request_vote_req{
     current_term = CurrentTerm,
     voted_for = VotedFor,
     log = Log
-} = State) ->
-    NewState = if
-        Term < CurrentTerm -> % candidate has an old term, deny vote
-            logger:debug("follower: request_vote: wrong term~n", []),
-            reply_request_vote(From, CurrentTerm, false),
-            State;
-        (VotedFor == null) or (VotedFor == CandidateId) ->
-            % no vote casted or repeated request_vote
-            % update current term
-            NewState_ = State#state{current_term=max(CurrentTerm,Term)},
-            {MyLastLogIndex, MyLastLogTerm} = last_log_index_term(Log),
-            if 
-                MyLastLogIndex > 0 -> % log is not empty
-                    if 
-                        LastLogTerm > MyLastLogTerm -> 
-                            % leader log is more updated than mine, vote for 
-                            % him
-                            logger:debug("follower: request_vote: voting for ~p (higher term)~n", [CandidateId]),
-                            reply_request_vote(From, CurrentTerm, true),
-                            % remember who I voted for
-                            NewState_#state{voted_for=CandidateId};
-                        (LastLogTerm == MyLastLogTerm) and (LastLogIndex >= MyLastLogIndex) ->
-                            % leader log is more updated than mine, vote for 
-                            % him
-                            logger:debug("follower: request_vote: voting for ~p (higher index)~n", [CandidateId]),
-                            reply_request_vote(From, CurrentTerm, true),
-                            % remember who I voted for
-                            NewState_#state{voted_for=CandidateId};
-                        true -> % leader log is out-dated, deny vote
-                            logger:debug("follower: request_vote: outdated log~n", []),
-                            reply_request_vote(From, CurrentTerm, false),
-                            NewState_
-                    end;
-                true -> % empty log, vote for the candidate
-                    logger:debug("follower: request_vote: voting for ~p (empty log)~n", [CandidateId]),
-                    reply_request_vote(From, CurrentTerm, true),
-                    % remember who I voted for
-                    NewState_#state{voted_for=CandidateId}
-            end;
-        true -> % already voted, deny vote
-            logger:debug("follower: request_vote: voted already~n", []),
+} = State)
+when (VotedFor == null) or (VotedFor == CandidateId) -> 
+    NewState = case log_up_to_date(Log, LastLogIndex, LastLogTerm) of
+        true ->
+            logger:debug("follower: request_vote: voting for ~p~n", 
+                        [CandidateId]),
+            reply_request_vote(From, CurrentTerm, true),
+            % remember who I voted for
+            State#state{voted_for=CandidateId};
+        false -> % leader log is out-dated, deny vote
+            logger:debug("follower: request_vote: outdated log~n", []),
             reply_request_vote(From, CurrentTerm, false),
             State
     end,
-    % reset election timeout
-    {keep_state, NewState,
+    % update current term and reset election timeout
+    {keep_state, NewState#state{current_term=max(CurrentTerm,Term)},
         [{state_timeout, rand_election_timeout(), electionTimeout}]};
+  
+% already voted, deny vote
+follower(cast, {request_vote, From, _Req}, #state{
+    current_term = CurrentTerm
+} = State) -> 
+    logger:debug("follower: request_vote: voted already~n", []),
+    reply_request_vote(From, CurrentTerm, false),
+    % reset election timeout
+    {keep_state, State,
+        [{state_timeout, rand_election_timeout(), electionTimeout}]};
+
 
 % for any other event, use the common handler
 follower(EventType, EventContent, Data) ->
@@ -404,7 +423,8 @@ follower(EventType, EventContent, Data) ->
 %% A candidate asks other nodes to vote for him and, if it receives a 
 %% majority of the votes, it becomes the new leader.
 
-% not enough replies within time, start a new election
+% start a new election (either electionTimeout on follower or not enough 
+% replies within time)
 candidate(state_timeout, electionTimeout, #state{
     current_term=CurrentTerm,
     log=Log,
@@ -424,72 +444,94 @@ candidate(state_timeout, electionTimeout, #state{
     {keep_state, NewState, 
         [{state_timeout, rand_election_timeout(), electionTimeout}]};
 
-% reply from other node
+
+%% request_vote RPC reply
+
+% term is higher, convert to follower
+candidate(cast, {request_vote_rpy, _From, #request_vote_rpy{
+    term=Term
+}}, #state{
+    current_term=CurrentTerm
+}=State) when Term > CurrentTerm->
+    logger:debug("candidate: request_vote_rpy: term is higher~n"),
+    {next_state, follower, State#state{current_term=Term},
+        [{state_timeout, rand_election_timeout(), electionTimeout}]};
+
+% vote is in favour. If votes received from majority of servers, then
+% become leader
 candidate(cast, {request_vote_rpy, From, #request_vote_rpy{
-    term=Term,
     vote_granted=VoteGranted
 }}, #state{
     votes_for=VotesFor,
-    current_term=CurrentTerm,
     log=Log,
     nodes=Nodes
-}=State) ->
+}=State) 
+when VoteGranted ->
+    NewVotesFor = sets:add_element(node(From), VotesFor),
+    Quorum = quorum(),
+    NVotes = sets:size(NewVotesFor),
     if 
-        VoteGranted -> 
-            NewVotesFor = sets:add_element(node(From), VotesFor),
-            Quorum = quorum(),
-            NVotes = sets:size(NewVotesFor),
-            if 
-                NVotes >= Quorum -> % reached quorum, become leader
-                    logger:debug("candidate: request_vote_rpy: reached quorum (~p)~n", [NVotes]),
-                    logger:info("elected as leader~n", []),
-                    {LastLogIndex, _LastLogTerm} = last_log_index_term(Log),
-                    {next_state, leader, State#state{
-                            leader=node(self()),
-                            next_index=maps:from_list([
-                                {Node, LastLogIndex+1}
-                                || Node <- Nodes
-                            ]),
-                            match_index=maps:from_list([
-                                {Node, 0}
-                                || Node <- Nodes
-                            ]),
-                            pending_requests=[]   
-                        }, 
-                        % send heartbeat to notify election end
-                        [{state_timeout, 0, heartBeatTimeout}]
-                    };
-                true -> % not enough votes, update state and wait
-                    logger:debug("candidate: request_vote_rpy: not enough votes (~p)~n", [NVotes]),
-                    {keep_state, State#state{votes_for=NewVotesFor}}
-            end;
-        true -> % candidate has been rejected
-            logger:debug("candidate: request_vote_rpy: vote rejected from ~p~n", [node(From)]),
-            {keep_state, State#state{current_term=max(Term,CurrentTerm)}}
+        NVotes >= Quorum -> % reached quorum, become leader
+            logger:debug("candidate: request_vote_rpy: reached quorum (~p)~n", 
+                        [NVotes]),
+            logger:info("elected as leader~n", []),
+            {LastLogIndex, _LastLogTerm} = last_log_index_term(Log),
+            {next_state, leader, State#state{
+                    leader=node(self()),
+                    next_index=maps:from_list([
+                        {Node, LastLogIndex+1}
+                        || Node <- Nodes
+                    ]),
+                    match_index=maps:from_list([
+                        {Node, 0}
+                        || Node <- Nodes
+                    ]),
+                    pending_requests=[]   
+                }, 
+                % send heartbeat to notify election end
+                [{state_timeout, 0, heartBeatTimeout}]
+            };
+        true -> % not enough votes, update state and wait
+            logger:debug("candidate: request_vote_rpy: not enough votes: ~p~n", 
+                [NVotes]),
+            {keep_state, State#state{votes_for=NewVotesFor}}
     end;
 
-% receive a request to vote from another candidate
-candidate(cast, {request_vote, From, #request_vote_req{
-    term=Term
-}}, #state{current_term=CurrentTerm}=State) ->
-    if 
-        Term > CurrentTerm -> % his term is higher, vote for him
-            logger:debug("candidate: request_vote: term is higher~n", []),
-            {next_state, follower, State#state{
-                current_term=Term,
-                voted_for=null
-            }, 
-            % request_vote handled in follower state
-            [postpone]};
-        true -> % otherwise, deny vote
-            logger:debug("candidate: request_vote: refused~n", []),
-            reply_request_vote(From, CurrentTerm, false),
-            keep_state_and_data
-    end;
+% vote is against, ignore
+candidate(cast, {request_vote_rpy, From, _Req}, _State) ->
+    logger:debug("candidate: request_vote_rpy: vote rejected from ~p~n", 
+                [node(From)]),
+    keep_state_and_data;
+
+
+%% request_vote RPC
+%% receive a request to vote from another candidate
+
+% his term is higher, revert to follower and vote for him
+candidate(cast, {request_vote, _From, 
+        #request_vote_req{term=Term}}, 
+    #state{current_term=CurrentTerm}=State) 
+when Term > CurrentTerm -> 
+    logger:debug("candidate: request_vote: term is higher~n", []),
+    {next_state, follower, State#state{
+        current_term=Term,
+        voted_for=null
+    }, 
+    % request_vote handled in follower state
+    [postpone]};
+
+% otherwise deny the vote
+candidate(cast, {request_vote, From, _Req}, #state{current_term=CurrentTerm}) ->
+    logger:debug("candidate: request_vote: refused~n", []),
+    reply_request_vote(From, CurrentTerm, false),
+    keep_state_and_data;
+
+
+%% append_entries RPC
 
 % received append_entries from new leader, revert to follower and handle it
 candidate(cast, {append_entries, _From, _Req}, State) ->
-    %TODO check correctness
+    %TODO check correctness. should I check the term?
     logger:debug("candidate: append_entries: backing to follower~n", []),
     {next_state, follower, State, [postpone]};
 
@@ -511,9 +553,32 @@ leader(state_timeout, heartBeatTimeout, State) ->
         {state_timeout, ?HEART_BEAT_TIMEOUT, heartBeatTimeout}
     ]};
 
-% client sent a reply to append entries
+
+%% append_entries RPC reply
+%% client sent a reply to append entries
+
+% reply refers to an older term, ignore
+leader(cast, {append_entries_rpy, _From, 
+        #append_entries_rpy{term=Term}
+    }, #state{current_term=CurrentTerm}) 
+when Term < CurrentTerm ->
+    logger:debug("leader: append_entries_rpy: old term~n", []),
+    keep_state_and_data;
+
+% reply is from a newer term, revert to follower
+% === this should NEVER happen ===
+leader(cast, {append_entries_rpy, _From, 
+        #append_entries_rpy{term=Term}
+    }, #state{current_term=CurrentTerm}=State) 
+when Term > CurrentTerm -> 
+    logger:error("leader: append_entries_rpy: newer term, backing off ~n", []),
+    {next_state, follower, State#state{
+        current_term=Term,
+        voted_for=null
+    }, [postpone]};
+
+% append_entries was successful, update internal view of follower
 leader(cast, {append_entries_rpy, From, #append_entries_rpy{
-    term=Term, 
     success=Success,
     match_index=MatchIndex}
 }, #state{
@@ -524,54 +589,51 @@ leader(cast, {append_entries_rpy, From, #append_entries_rpy{
     log=Log,
     pending_requests=PendingRequests,
     last_applied=LastApplied
-}=State) ->
+}=State)
+when Success ->  
     Node = node(From),
-    NewState = if
-        Term < CurrentTerm -> % reply refers to an older term, ignore
-            logger:debug("leader: append_entries_rpy: old term~n", []),
-            State;
-        Term > CurrentTerm -> % reply is from a newer term, revert to follower
-            % this should not happen in practice
-            logger:debug("leader: append_entries_rpy: newer term, backing off~n", []),
-            {next_state, follower, State#state{
-                current_term=Term,
-                voted_for=null
-            }, [postpone]};
-        Success ->  
-            % append_entries was successfull, update internal view of follower
-            logger:debug("leader: append_entries_rpy: success~n", []),
-            NewNextIndexMap = maps:put(Node, MatchIndex+1, NextIndexMap),
-            NewMatchIndexMap = maps:put(Node, MatchIndex, MatchIndexMap),
-            % check whether new entries can be commited
-            NewCommitIndex = update_commit_index(CommitIndex, NewMatchIndexMap, Log, CurrentTerm),
-            % if so, do those commits
-            NewPendingRequests = do_commit_entries(LastApplied+1, NewCommitIndex, Log, PendingRequests),
-            State#state{
-                next_index=NewNextIndexMap,
-                match_index=NewMatchIndexMap,
-                commit_index=NewCommitIndex,
-                last_applied=NewCommitIndex,
-                pending_requests=NewPendingRequests
-            };
-        true -> % Success is false
-            OldNextIndex = maps:get(Node, NextIndexMap),
-            if 
-                OldNextIndex == 0 -> 
-                    % cannot decrease next_index further, it means that the 
-                    % follower is misbehaving, ignore it
-                    logger:debug("leader: append_entries_rpy: next_index is already 0~n", []),
-                    State;
-                true -> % decrease next_index and retry
-                    NewNextIndexMap = maps:put(Node, OldNextIndex-1, 
-                                                NextIndexMap),
-                    NewState_ = State#state{
-                        next_index=NewNextIndexMap
-                    },
-                    send_append_entries(node(From), NewState_),
-                    NewState_
-            end
-    end,
-    {keep_state, NewState};
+    logger:debug("leader: append_entries_rpy: success~n", []),
+    NewNextIndexMap = maps:put(Node, MatchIndex+1, NextIndexMap),
+    NewMatchIndexMap = maps:put(Node, MatchIndex, MatchIndexMap),
+    % check whether new entries can be commited
+    NewCommitIndex = update_commit_index(CommitIndex, NewMatchIndexMap, 
+                                        Log, CurrentTerm),
+    % if so, do those commits
+    NewPendingRequests = do_commit_entries(LastApplied+1, NewCommitIndex, 
+                                        Log, PendingRequests),
+    {keep_state, State#state{
+        next_index=NewNextIndexMap,
+        match_index=NewMatchIndexMap,
+        commit_index=NewCommitIndex,
+        last_applied=NewCommitIndex,
+        pending_requests=NewPendingRequests
+    }};
+
+% append_entries failed, decrease next_index if possible and retry 
+leader(cast, {append_entries_rpy, From, _Req}, 
+    #state{next_index=NextIndexMap}=State
+) ->
+    Node = node(From),
+    OldNextIndex = maps:get(Node, NextIndexMap),
+    if 
+        OldNextIndex == 0 -> 
+            % cannot decrease next_index further, it means that the 
+            % follower is misbehaving, ignore it
+            logger:debug("leader: append_entries_rpy: next_index already 0~n", 
+                        []),
+            {keep_state, State};
+        true -> % decrease next_index and retry
+            NewNextIndexMap = maps:put(Node, OldNextIndex-1, 
+                                        NextIndexMap),
+            NewState = State#state{
+                next_index=NewNextIndexMap
+            },
+            send_append_entries(node(From), NewState),
+            {keep_state, NewState}
+    end;
+
+
+%% add_entry RPC (client)
 
 % add the new entry to the log and send append entries to all other nodes
 leader({call, From}, {add_entry, Entry}, #state{
@@ -586,6 +648,7 @@ leader({call, From}, {add_entry, Entry}, #state{
         % reset heartbeat timeout
         {state_timeout, ?HEART_BEAT_TIMEOUT, heartBeatTimeout}
     ]};
+
 
 % for any other event, use the common handler
 leader(EventType, EventContent, Data) ->
@@ -617,6 +680,7 @@ handle_common(State, EventType, _EventContent, _Data) ->
     logger:debug("~p: event not handled: ~p~n", [State, EventType]),
     keep_state_and_data.
 
+
 %%--------------------------------------------------------------------
 %% @private
 %% @doc
@@ -642,7 +706,9 @@ terminate(_Reason, _StateName, _State) ->
 
 % request votes from all other nodes
 request_votes(Nodes, Term, CandidateId, LastLogIndex, LastLogTerm) ->
-    logger:debug("(request_votes) term=~p, candidate=~p, last_log_index=~p, last_log_term=~p~n", [Term, CandidateId, LastLogIndex, LastLogTerm]),
+    logger:debug("(request_votes) term=~p, candidate=~p, last_log_index=~p, "
+                 "last_log_term=~p~n", 
+                 [Term, CandidateId, LastLogIndex, LastLogTerm]),
     send_all(Nodes, {request_vote, self(), #request_vote_req{
             term=Term, 
             candidate_id=CandidateId, 
@@ -660,7 +726,9 @@ send_heartbeat(#state{
     nodes=Nodes
 }) -> 
     {LastLogIndex, LastLogTerm} = last_log_index_term(Log),
-    logger:debug("(send_heartbeat) term=~p, commit_index=~p, last_log_index=~p, last_log_term=~p~n", [CurrentTerm, CommitIndex, LastLogIndex, LastLogTerm]),
+    logger:debug("(send_heartbeat) term=~p, commit_index=~p, "
+                 "last_log_index=~p, last_log_term=~p~n", 
+                 [CurrentTerm, CommitIndex, LastLogIndex, LastLogTerm]),
     send_all(Nodes, {append_entries, self(), #append_entries_req{
         term=CurrentTerm, 
         leader_id=node(self()), 
@@ -706,7 +774,9 @@ send_append_entries(Node, #state{
     NextIndex = maps:get(Node, NextIndexMap),
     PrevLogIndex = max(0, NextIndex-1),
     PrevLogTerm = nth_log_entry_term(PrevLogIndex, Log),
-    logger:debug("(send_append_entries) node=~p, term=~p, prev_log_index=~p, prev_log_term=~p leader_commit=~p~n", [Node, CurrentTerm, PrevLogIndex, PrevLogTerm, CommitIndex]),
+    logger:debug("(send_append_entries) node=~p, term=~p, prev_log_index=~p,"
+                 " prev_log_term=~p leader_commit=~p~n", 
+                 [Node, CurrentTerm, PrevLogIndex, PrevLogTerm, CommitIndex]),
 
     gen_statem:cast({?SERVER, Node}, {append_entries, self(), 
         #append_entries_req{
@@ -723,7 +793,9 @@ send_append_entries(Node, #state{
 
 % reply to an append entries request
 reply_append_entries(To, Term, Success, MatchIndex) ->
-    logger:debug("(reply_append_entries) node=~p, term=~p, success=~p, index=~p~n", [To, Term, Success, MatchIndex]),
+    logger:debug("(reply_append_entries) node=~p, term=~p, success=~p,"
+                 " index=~p~n", 
+                 [To, Term, Success, MatchIndex]),
     gen_statem:cast({?SERVER, node(To)}, {append_entries_rpy, self(), 
         #append_entries_rpy{
             term=Term,
@@ -736,17 +808,56 @@ reply_append_entries(To, Term, Success, MatchIndex) ->
 
 % reply to a request_vote request
 reply_request_vote(To, Term, VoteGranted) ->
-    logger:debug("(reply_request_vote) node=~p, term=~p, vote_granted=~p~n", [To, Term, VoteGranted]),
-    gen_statem:cast({?SERVER, node(To)}, {request_vote_rpy, self(), #request_vote_rpy{
-        term=Term,
-        vote_granted=VoteGranted
-    }}).
+    logger:debug("(reply_request_vote) node=~p, term=~p, vote_granted=~p~n",
+                [To, Term, VoteGranted]),
+    gen_statem:cast({?SERVER, node(To)}, {request_vote_rpy, self(), 
+                    #request_vote_rpy{
+                        term=Term,
+                        vote_granted=VoteGranted
+                    }
+                }
+    ).
+
+%%--------------------------------------------------------------------
+%% request_vote-related functions
+%%--------------------------------------------------------------------
+
+% check whether other log (indicated by LastLogIndex and LastLogTerm) is 
+% as up-to-date as the local log
+log_up_to_date(Log, LastLogIndex, LastLogTerm) ->
+    {MyLastLogIndex, MyLastLogTerm} = last_log_index_term(Log),
+    log_up_to_date(MyLastLogIndex, MyLastLogTerm, LastLogIndex, LastLogTerm).
+
+
+% empty log, anything would be as up to date as it
+log_up_to_date(MyLastLogIndex, _MyLastLogTerm, _LastLogIndex, _LastLogTerm)
+when MyLastLogIndex =< 0 ->
+    true;
+
+% term is higher, then it is more up-to-date
+log_up_to_date(_MyLastLogIndex, MyLastLogTerm, _LastLogIndex, LastLogTerm)
+when LastLogTerm > MyLastLogTerm ->
+    true;
+
+% term is same but index is higher, then it is more up-to-date
+log_up_to_date(MyLastLogIndex, MyLastLogTerm, LastLogIndex, LastLogTerm)
+when (LastLogTerm == MyLastLogTerm) and (LastLogIndex >= MyLastLogIndex) ->
+    true;
+
+% otherwise it is out-dated
+log_up_to_date(_MyLastLogIndex, _MyLastLogTerm, _LastLogIndex, _LastLogTerm) ->
+    false.
 
 %%--------------------------------------------------------------------
 %% append_entries-related functions (appending and committing)
 %%--------------------------------------------------------------------
 
 % add the new entries to the log and commit any uncommitted entries
+% - If an existing entry conflicts with a new one (same index but different
+%   terms), delete the existing entry and all that follow it.
+% - Append any new entries not already in the log
+% - If leader_commit > commit_index, set 
+%   commit_index = min(leader_commit, index of last new entry)
 do_append_entries(#append_entries_req{
     term=Term,
     leader_id=Leader, 
@@ -761,7 +872,9 @@ do_append_entries(#append_entries_req{
     case Entries of
         [] ->
             pass;
-        _ -> logger:info("(do_append_entries) prev_log_index=~p, size(entries)=~p~n", [PrevLogIndex, length(Entries)])
+        _ -> logger:info("(do_append_entries) prev_log_index=~p, "
+                         "size(entries)=~p~n", 
+                         [PrevLogIndex, length(Entries)])
     end,
     % build new log, overwriting any conflicting entry
     NewLog = lists:sublist(Log, PrevLogIndex+1) ++ Entries,
@@ -802,10 +915,12 @@ update_commit_index(OldCommitIndex, MatchIndexMap, Log, CurrentTerm) ->
     if 
         (NextCommitIndex > OldCommitIndex) and (NthTerm == CurrentTerm) ->
             % ok
-            logger:debug("(update_commit_index) new commit index is ~p~n", [NextCommitIndex]),
+            logger:debug("(update_commit_index) new commit index is ~p~n", 
+                        [NextCommitIndex]),
             NextCommitIndex;
         true -> % entry was from another leader, ignore
-            logger:debug("(update_commit_index) commit index did not change (~p)~n", [OldCommitIndex]),
+            logger:debug("(update_commit_index) commit index is ~p~n", 
+                        [OldCommitIndex]),
             OldCommitIndex
     end.
 
@@ -860,7 +975,7 @@ do_commit_entries(From, To, Log, PendingRequests) ->
 % send a commit_entry RPC to FSM
 commit_entry(#log_entry{content=Entry}) ->
     logger:info("(commit_entry) ~p~n", [Entry]),
-    gen_server:call(?FSM_MODULE, {commit_entry, Entry}).
+    ?FSM_MODULE:commit_entry(Entry).
 
 %%--------------------------------------------------------------------
 
@@ -876,16 +991,19 @@ acknowledge_request(CommitIndex, Requests) ->
 acknowledge_request(_CommitIndex, [], NewPendingRequests, Handled) -> 
     {Handled, NewPendingRequests};
     
-acknowledge_request(CommitIndex, [{Node, Index} | TRequests], NewPendingRequests, _Handled) 
+acknowledge_request(CommitIndex, [{Node, Index} | TRequests], 
+                    NewPendingRequests, _Handled) 
 when Index == CommitIndex -> % reply
     logger:debug("(acknowledge_request) node=~p, index=~p~n", [Node, Index]),
     gen_statem:reply(Node, ok),
     % remove this item from list, set handled to true
     acknowledge_request(CommitIndex, TRequests, NewPendingRequests, true); 
 
-acknowledge_request(CommitIndex, [HRequest | TRequests], NewPendingRequests, Handled) -> % no reply
+acknowledge_request(CommitIndex, [HRequest | TRequests], NewPendingRequests, 
+                    Handled) -> % no reply
     % pass list as is, handled as is
-    acknowledge_request(CommitIndex, TRequests, [HRequest | NewPendingRequests], Handled).
+    acknowledge_request(CommitIndex, TRequests, 
+                        [HRequest | NewPendingRequests], Handled).
 
 %%--------------------------------------------------------------------
 %% Log-related functions
