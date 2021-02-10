@@ -6,16 +6,16 @@
 -export([init/1, handle_call/3, handle_cast/2]).
 
 % RAFT API
--export([commit_entry/1]).
+-export([commit_entry/2]).
 
 % Client API
 -export([get/1, get_all/0, set/2, delete/1, delete_all/0]).
 
 
 %%% RAFT API %%%
-commit_entry(Entry) ->
+commit_entry(Index, Entry) ->
     logger:notice("(commit_entry) ~p~n", [Entry]),
-    gen_server:call(?MODULE, {sync, Entry}, infinity).
+    gen_server:call(?MODULE, {sync, Entry, Index}, infinity).
 
 %%% Client API %%%
 get(Key) ->
@@ -44,25 +44,44 @@ start_link() ->
     gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
 
 init(_Args) ->
-    {ok, dict:new()}.
+    { ok, { 0, dict:new() } }.
 
-handle_call({execute, { Operation, Parameters } = Action}, From, State)
+add_raft_entry({ Operation, _ } = Action)
     when ( Operation == set ) or ( Operation == delete ) or ( Operation == delete_all ) ->
-        %Node = raft_statem:get_leader(),
-        %gen_server:call({ kv_store, Node }, Action)
-        %raft_statem:add_entry(Node, Action),
-        handle_action(Action, From, State);
+        raft_statem:add_entry(Action);
 
-handle_call({execute, Action}, From, State) ->
-    handle_action(Action, From, State);
+add_raft_entry(_) -> ok.
 
-handle_call({sync, Action}, From, State) ->
-    handle_action(Action, From, State);
+handle_call({execute, Action}, _From, State) ->
+    Leader = raft_statem:get_leader(),
+    Node = node(self()),
+    case Leader of
+        Node ->
+            case add_raft_entry(Action) of
+                error -> {reply, error, State};
+                { ok, NewIndex} ->
+                    {_, Dict} = State,
+                    {Result, NewDict} = handle_action(Action, Dict),
+                    {reply, Result, {NewIndex, NewDict}}
+            end;
+        _ ->
+            Reply = gen_server:call({ kv_store, Leader}, Action),
+            {reply, Reply, State}
+    end;
+
+handle_call({sync, _, NewIndex}, _From, {Index, _} = State)
+    when ( NewIndex =/= Index + 1 ) ->
+        {reply, { error, Index }, State };
+
+handle_call({sync, Action, NewIndex}, _From, {_, Dict}) ->
+        {_, NewDict} = handle_action(Action, Dict),
+        {reply, ok, {NewIndex, NewDict}};
+
 
 handle_call(Action, From, State) ->
     handle_call({execute, Action}, From, State).
 
-handle_action({ get, { Key } }, _From, Dict) ->
+handle_action({ get, { Key } }, Dict) ->
     logger:notice("--- Get ~p ---~n", [ Key ]),
     Result = dict:find(Key, Dict),
     ResultValue = case Result of
@@ -70,27 +89,27 @@ handle_action({ get, { Key } }, _From, Dict) ->
         error -> error;
         _ -> error
     end,
-    {reply, ResultValue, Dict};
+    {ResultValue, Dict};
 
-handle_action({get_all, { } }, _From, Dict) ->
+handle_action({get_all, { } }, Dict) ->
     logger:notice("--- Get all ---~n", [ ]),
     Result = dict:to_list(Dict),
-    {reply, Result, Dict};
+    {Result, Dict};
 
-handle_action({set, { Key, Value } }, _From, Dict) ->
+handle_action({set, { Key, Value } }, Dict) ->
     logger:notice("--- Set ~p:~p ---~n", [ Key, Value ]),
-    NewState = dict:store(Key, Value, Dict),
-    {reply, ok, NewState};
+    NewDict = dict:store(Key, Value, Dict),
+    {ok, NewDict};
 
-handle_action({delete, { Key }}, _From, Dict) ->
+handle_action({delete, { Key }}, Dict) ->
     logger:notice("--- Delete ~p ---~n", [ Key ]),
-    NewState = dict:erase(Key, Dict),
-    {reply, ok, NewState};
+    NewDict = dict:erase(Key, Dict),
+    {ok, NewDict};
 
-handle_action({delete_all, { } }, _From, Dict) ->
+handle_action({delete_all, { } }, _) ->
     logger:notice("--- Delete all ---~n", [ ]),
-    NewState = dict:new(),
-    {reply, ok, NewState}.
+    NewDict = dict:new(),
+    {ok, NewDict}.
 
 
 handle_cast(_, State) ->
