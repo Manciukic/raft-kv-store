@@ -599,13 +599,14 @@ when Success ->
     NewCommitIndex = update_commit_index(CommitIndex, NewMatchIndexMap, 
                                         Log, CurrentTerm),
     % if so, do those commits
-    NewPendingRequests = do_commit_entries(LastApplied+1, NewCommitIndex, 
-                                        Log, PendingRequests),
+    {NewPendingRequests, NewLastApplied} = do_commit_entries(LastApplied+1, 
+                                            NewCommitIndex, Log, 
+                                            PendingRequests),
     {keep_state, State#state{
         next_index=NewNextIndexMap,
         match_index=NewMatchIndexMap,
         commit_index=NewCommitIndex,
-        last_applied=NewCommitIndex,
+        last_applied=NewLastApplied,
         pending_requests=NewPendingRequests
     }};
 
@@ -888,13 +889,14 @@ do_append_entries(#append_entries_req{
     logger:debug("(do_append_entries) committing entries from ~p to ~p~n",
         [LastApplied+1, NewCommitIndex]),
     logger:debug("(do_append_entries) log=~p~n", [NewLog]),
-    do_commit_entries(LastApplied+1, NewCommitIndex, NewLog, []),
+    {_, NewLastApplied} = do_commit_entries(LastApplied+1, NewCommitIndex, 
+                        NewLog, []),
     State#state{
         leader=Leader,
         commit_index=NewCommitIndex,
         log=NewLog,
         current_term=Term,
-        last_applied=NewCommitIndex
+        last_applied=NewLastApplied
     }.
 
 %%--------------------------------------------------------------------
@@ -956,26 +958,40 @@ find_next_commit_index(TryIndex, MatchIndexMap) ->
 
 % in case indices are invalid, do nothing
 do_commit_entries(From, To, _Log, PendingRequests) when From > To ->
-    PendingRequests;
+    {PendingRequests, To};
 
 do_commit_entries(From, To, Log, PendingRequests) ->
     % send replies if FSM is waiting
     {Handled, NewPendingRequests} = acknowledge_request(From, PendingRequests),
-    if 
+    Result = if 
         Handled -> % reply sent, do nothing
-            pass;
+            ok;
         true -> % issue commit on FSM otherwise
-            commit_entry(nth_log_entry(From, Log))
+            commit_entry(From, nth_log_entry(From, Log))
     end,
+    case Result of 
+        ok ->
     % commit next index
-    do_commit_entries(From+1, To, Log, NewPendingRequests).
+            do_commit_entries(From+1, To, Log, NewPendingRequests);
+        {error, FsmIndex} ->
+            if 
+                FsmIndex =< To -> % FSM is either more updated or outdated
+                    % send all missing entries
+                    do_commit_entries(FsmIndex+1, To, Log, NewPendingRequests);
+                true -> 
+                    % FSM is more updated than RAFT, wtf?
+                    logger:warning("(do_commit_entries) FSM more updated than"
+                                    " RAFT", []),
+                    {NewPendingRequests, From-1}
+            end
+    end.
 
 %%--------------------------------------------------------------------
 
 % send a commit_entry RPC to FSM
-commit_entry(#log_entry{content=Entry}) ->
-    logger:info("(commit_entry) ~p~n", [Entry]),
-    ?FSM_MODULE:commit_entry(Entry).
+commit_entry(Index, #log_entry{content=Entry}) ->
+    logger:info("(commit_entry) ~p (~p)~n", [Index, Entry]),
+    ?FSM_MODULE:commit_entry(Index, Entry).
 
 %%--------------------------------------------------------------------
 
@@ -995,7 +1011,7 @@ acknowledge_request(CommitIndex, [{Node, Index} | TRequests],
                     NewPendingRequests, _Handled) 
 when Index == CommitIndex -> % reply
     logger:debug("(acknowledge_request) node=~p, index=~p~n", [Node, Index]),
-    gen_statem:reply(Node, ok),
+    gen_statem:reply(Node, {ok, CommitIndex}),
     % remove this item from list, set handled to true
     acknowledge_request(CommitIndex, TRequests, NewPendingRequests, true); 
 
