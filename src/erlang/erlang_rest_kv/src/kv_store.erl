@@ -46,9 +46,32 @@ start_link() ->
 init(_Args) ->
     { ok, { 0, dict:new() } }.
 
-handle_call({execute, Action}, _From, {_, Dict}) ->
-    { Result, NewDict } = handle_action(Action, Dict),
-    {reply, Result, { 0, NewDict } };
+add_raft_entry({ Operation, _ } = Action)
+    when ( Operation == set ) or ( Operation == delete ) or ( Operation == delete_all ) ->
+        raft_statem:add_entry(Action);
+
+add_raft_entry(_) -> { ok, no_state_change }.
+
+handle_call({execute, Action}, _From, {_, Dict} = State) ->
+    Leader = raft_statem:get_leader(),
+    Node = node(self()),
+    case Leader of
+        Node ->
+            case add_raft_entry(Action) of
+                { ok, no_state_change } ->
+                    {Result, _} = handle_action(Action, Dict),
+                    {reply, Result, State};
+                { ok, NewIndex} ->
+                    {Result, NewDict} = handle_action(Action, Dict),
+                    {reply, Result, {NewIndex, NewDict}};
+                _ -> {reply, error, State}
+            end;
+        null ->
+            {reply, {error, leader_not_connected}, State};
+        _ ->
+            Reply = gen_server:call({ kv_store, Leader}, Action),
+            {reply, Reply, State}
+    end;
 
 handle_call({sync, _, NewIndex}, _From, {Index, _} = State)
     when ( NewIndex =/= Index + 1 ) ->
