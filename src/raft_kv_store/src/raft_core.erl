@@ -324,13 +324,25 @@ follower(cast, {append_entries, From, #append_entries_req{
     term=Term
 }}, #state{
     current_term=CurrentTerm
-} = State) 
+}) 
 when Term < CurrentTerm ->
     logger:debug("follower: append_entries: old term~n", []),
     reply_append_entries(From, CurrentTerm, false, 0),
     % reset the election timeout
-    {keep_state, State, 
-        [{state_timeout, rand_election_timeout(), electionTimeout}]};
+    keep_state_and_data;
+
+% update state if term is higher and then handle event
+follower(cast, {append_entries, _From, #append_entries_req{
+    term=Term
+}}=EventContent, #state{
+    current_term=CurrentTerm
+}=State) 
+when Term > CurrentTerm ->
+    logger:debug("follower: found newer term (~p)~n", [Term]),
+    follower(cast, EventContent, State#state{
+            current_term=Term,
+            voted_for=null
+        });
 
 % reply false if log doesn't contain an entry at prev_log_index
 % i.e. local log is out-of-sync, signal it to leader
@@ -339,15 +351,13 @@ follower(cast, {append_entries, From, #append_entries_req{
     prev_log_index=PrevLogIndex
 }}, #state{
     log=Log
-} = State)
+})
 when PrevLogIndex > length(Log) -> 
     logger:debug("follower: append_entries: prev_log_index not in log (~p)~n", 
                 [PrevLogIndex]),
     reply_append_entries(From, Term, false, length(Log)),
-    NewState = State#state{current_term=Term},
-    persist_state(NewState),
     % reset the election timeout
-    {keep_state, NewState, 
+    {keep_state_and_data, 
         [{state_timeout, rand_election_timeout(), electionTimeout}]};
 
 % reply false if log doesn't contain an entry at prev_log_index whose
@@ -365,7 +375,7 @@ follower(cast, {append_entries, From, #append_entries_req{
             % entry is incompatible with local log, deny it
             logger:debug("follower: append_entries: wrong nth log term~n", []),
             reply_append_entries(From, Term, false, PrevLogIndex),
-            State#state{current_term=Term};
+            State;
         true -> % ok
             logger:debug("follower: append_entries: ok~n", []),
             NewState2 = do_append_entries(Req, State),
@@ -373,7 +383,6 @@ follower(cast, {append_entries, From, #append_entries_req{
             reply_append_entries(From, Term, true, length(NewLog)),
             NewState2
     end,
-    persist_state(NewState),
     % reset the election timeout
     {keep_state, NewState, 
         [{state_timeout, rand_election_timeout(), electionTimeout}]};
@@ -386,18 +395,28 @@ follower(cast, {request_vote, From, #request_vote_req{
     term = Term
 }}, #state{
     current_term = CurrentTerm
-} = State)
+})
 when Term < CurrentTerm -> 
     logger:debug("follower: request_vote: wrong term~n", []),
     reply_request_vote(From, CurrentTerm, false),
-    % reset election timeout
-    {keep_state, State,
-        [{state_timeout, rand_election_timeout(), electionTimeout}]};
+    keep_state_and_data;
+      
+% update state if term is higher and then handle event
+follower(cast, {request_vote, _From, #request_vote_req{
+    term = Term
+}}=EventContent, #state{
+    current_term = CurrentTerm
+}=State)
+when Term > CurrentTerm -> 
+    logger:debug("follower: found newer term (~p)~n", [Term]),
+    follower(cast, EventContent, State#state{
+            current_term=Term,
+            voted_for=null
+        });
       
 % if voted_for is null or candidate_id, and candidate's log is at least 
 % as up-to-date as receiver's log, grant vote
 follower(cast, {request_vote, From, #request_vote_req{
-    term = Term, 
     candidate_id = CandidateId, 
     last_log_index = LastLogIndex, 
     last_log_term = LastLogTerm
@@ -413,28 +432,24 @@ when (VotedFor == null) or (VotedFor == CandidateId) ->
                         [CandidateId]),
             reply_request_vote(From, CurrentTerm, true),
             % remember who I voted for
-            State#state{voted_for=CandidateId};
+            persist_state(State#state{voted_for=CandidateId});
         false -> % leader log is out-dated, deny vote
             logger:debug("follower: request_vote: outdated log~n", []),
             reply_request_vote(From, CurrentTerm, false),
             State
     end,
-    % update current term
-    NewState2 = NewState#state{current_term=max(CurrentTerm,Term)},
-    persist_state(NewState2),
     % reset election timeout
-    {keep_state, NewState2,
+    {keep_state, NewState,
         [{state_timeout, rand_election_timeout(), electionTimeout}]};
   
 % already voted, deny vote
 follower(cast, {request_vote, From, _Req}, #state{
     current_term = CurrentTerm
-} = State) -> 
+}) -> 
     logger:debug("follower: request_vote: voted already~n", []),
     reply_request_vote(From, CurrentTerm, false),
     % reset election timeout
-    {keep_state, State,
-        [{state_timeout, rand_election_timeout(), electionTimeout}]};
+    keep_state_and_data;
 
 
 % for any other event, use the common handler
@@ -462,25 +477,20 @@ candidate(state_timeout, electionTimeout, #state{
     % request votes from all other nodes
     request_votes(Nodes, CurrentTerm, node(self()), 
                   LastLogIndex, LastLogTerm),
-    persist_state(NewState),
     % start a new election timeout
-    {keep_state, NewState, 
+    {keep_state, persist_state(NewState), 
         [{state_timeout, rand_election_timeout(), electionTimeout}]};
 
 
 %% request_vote RPC reply
 
-% term is higher, convert to follower
+% term is higher, step down to follower
 candidate(cast, {request_vote_rpy, _From, #request_vote_rpy{
     term=Term
 }}, #state{
     current_term=CurrentTerm
 }=State) when Term > CurrentTerm->
-    logger:debug("candidate: request_vote_rpy: term is higher~n"),
-    NewState = State#state{current_term=Term, voted_for=null},
-    persist_state(NewState),
-    {next_state, follower, NewState,
-        [{state_timeout, rand_election_timeout(), electionTimeout}]};
+    stepdown(Term, State);
 
 % vote is in favour. If votes received from majority of servers, then
 % become leader
@@ -536,13 +546,7 @@ candidate(cast, {request_vote, _From,
         #request_vote_req{term=Term}}, 
     #state{current_term=CurrentTerm}=State) 
 when Term > CurrentTerm -> 
-    logger:debug("candidate: request_vote: term is higher~n", []),
-    {next_state, follower, State#state{
-        current_term=Term,
-        voted_for=null
-    }, 
-    % request_vote handled in follower state
-    [postpone]};
+    stepdown(Term, State);
 
 % otherwise deny the vote
 candidate(cast, {request_vote, From, _Req}, #state{current_term=CurrentTerm}) ->
@@ -553,11 +557,24 @@ candidate(cast, {request_vote, From, _Req}, #state{current_term=CurrentTerm}) ->
 
 %% append_entries RPC
 
-% received append_entries from new leader, revert to follower and handle it
-candidate(cast, {append_entries, _From, _Req}, State) ->
-    %TODO check correctness. should I check the term?
-    logger:debug("candidate: append_entries: backing to follower~n", []),
-    {next_state, follower, State, [postpone]};
+% received append_entries from old leader, send negative response
+candidate(cast, {append_entries, From, #append_entries_req{
+    term=Term
+}}, #state{
+    current_term=CurrentTerm
+}) 
+when Term < CurrentTerm ->
+    logger:debug("candidate: append_entries: old term~n", []),
+    reply_append_entries(From, CurrentTerm, false, 0),
+    keep_state_and_data;
+
+% received append_entries from new-ish leader, step back to follower
+candidate(cast, {append_entries, _From, #append_entries_req{
+    term=Term
+}}, State) ->
+    % I step down also if term is same since it means the leader won
+    % the election against me
+    stepdown(Term, State);
 
 % for any other event, use the common handler
 candidate(EventType, EventContent, Data) ->
@@ -595,11 +612,7 @@ leader(cast, {append_entries_rpy, _From,
         #append_entries_rpy{term=Term}
     }, #state{current_term=CurrentTerm}=State) 
 when Term > CurrentTerm -> 
-    logger:error("leader: append_entries_rpy: newer term, backing off ~n", []),
-    {next_state, follower, State#state{
-        current_term=Term,
-        voted_for=null
-    }, [postpone]};
+    stepdown(Term, State);
 
 % append_entries was successful, update internal view of follower
 leader(cast, {append_entries_rpy, From, #append_entries_rpy{
@@ -722,6 +735,20 @@ terminate(_Reason, _StateName, _State) ->
 %%%===================================================================
 %%% Internal functions
 %%%===================================================================
+
+% step down to follower when message with newer term is received
+% Achtung! Do not use in follower since event is not postponed if state
+% does not change
+stepdown(Term, State) ->
+    logger:info("Stepping down to follower (term=~p)~n", [Term]),
+    NewState = State#state{
+        current_term=Term,
+        voted_for=null
+    },
+    {next_state, follower, persist_state(NewState), [
+        postpone, 
+        {state_timeout, rand_election_timeout(), electionTimeout}
+    ]}.
 
 %%--------------------------------------------------------------------
 %% Communication functions
