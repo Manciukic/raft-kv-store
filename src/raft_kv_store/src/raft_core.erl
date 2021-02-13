@@ -33,6 +33,7 @@
          start/0,
          get_leader/0,
          add_entry/1,
+         add_entry/2,
          stop/0
         ]).
 
@@ -87,9 +88,6 @@
     % (initialized to 0, increases monotonically)
     % This is a map (key is node name, value is next_index)
     match_index, 
-
-    % list of client add_entry requests waiting for a reply
-    pending_requests, 
 
     % Volatile state on candidates 
     % (reinitialized at new election)
@@ -199,8 +197,15 @@ start() ->
 %%--------------------------------------------------------------------
 
 % append an entry to the log and replicate it among all nodes
+% this RPC returns immediately after leader starts replication
+% and returns the index and term of this entry. The client will
+% receive notification of the commit of the entry with the commit_entry
+% RPC.
 add_entry(Entry) ->
     gen_statem:call(?SERVER, {add_entry, Entry}).
+
+add_entry(Node, Entry) ->
+    gen_statem:call({?SERVER, Node}, {add_entry, Entry}).
 
 %%--------------------------------------------------------------------
 
@@ -244,7 +249,6 @@ init([]) ->
         next_index=maps:new(),
         match_index=maps:new(),
         leader=null,
-        pending_requests=[],
         nodes=lists:delete(node(self()), ?NODES)
     },
     [{state_timeout, rand_election_timeout(), electionTimeout}]}.
@@ -485,8 +489,7 @@ when VoteGranted ->
                     match_index=maps:from_list([
                         {Node, 0}
                         || Node <- Nodes
-                    ]),
-                    pending_requests=[]   
+                    ])
                 }, 
                 % send heartbeat to notify election end
                 [{state_timeout, 0, heartBeatTimeout}]
@@ -587,7 +590,6 @@ leader(cast, {append_entries_rpy, From, #append_entries_rpy{
     match_index=MatchIndexMap,
     commit_index=CommitIndex,
     log=Log,
-    pending_requests=PendingRequests,
     last_applied=LastApplied
 }=State)
 when Success ->  
@@ -599,15 +601,13 @@ when Success ->
     NewCommitIndex = update_commit_index(CommitIndex, NewMatchIndexMap, 
                                         Log, CurrentTerm),
     % if so, do those commits
-    {NewPendingRequests, NewLastApplied} = do_commit_entries(LastApplied+1, 
-                                            NewCommitIndex, Log, 
-                                            PendingRequests),
+    NewLastApplied = do_commit_entries(LastApplied+1, 
+                                            NewCommitIndex, Log),
     {keep_state, State#state{
         next_index=NewNextIndexMap,
         match_index=NewMatchIndexMap,
         commit_index=NewCommitIndex,
-        last_applied=NewLastApplied,
-        pending_requests=NewPendingRequests
+        last_applied=NewLastApplied
     }};
 
 % append_entries failed, decrease next_index if possible and retry 
@@ -638,14 +638,14 @@ leader(cast, {append_entries_rpy, From, _Req},
 
 % add the new entry to the log and send append entries to all other nodes
 leader({call, From}, {add_entry, Entry}, #state{
-    pending_requests=PendingRequests,
-    log=Log
+    log=Log,
+    current_term=CurrentTerm
 }=State) ->
     logger:debug("leader: add_entry~n", []),
     NewState=persist_entries([Entry], State),
     send_all_append_entries(NewState),
-    NewPendingRequests = [{From, length(Log)+1} | PendingRequests],
-    {keep_state, NewState#state{pending_requests=NewPendingRequests}, [
+    gen_statem:reply(From, {ok, {length(Log)+1, CurrentTerm}}),
+    {keep_state, NewState, [
         % reset heartbeat timeout
         {state_timeout, ?HEART_BEAT_TIMEOUT, heartBeatTimeout}
     ]};
@@ -889,8 +889,8 @@ do_append_entries(#append_entries_req{
     logger:debug("(do_append_entries) committing entries from ~p to ~p~n",
         [LastApplied+1, NewCommitIndex]),
     logger:debug("(do_append_entries) log=~p~n", [NewLog]),
-    {_, NewLastApplied} = do_commit_entries(LastApplied+1, NewCommitIndex, 
-                        NewLog, []),
+    NewLastApplied = do_commit_entries(LastApplied+1, NewCommitIndex, 
+                        NewLog),
     State#state{
         leader=Leader,
         commit_index=NewCommitIndex,
@@ -957,69 +957,35 @@ find_next_commit_index(TryIndex, MatchIndexMap) ->
 % This function can be called in either leader or follower states.
 
 % in case indices are invalid, do nothing
-do_commit_entries(From, To, _Log, PendingRequests) when From > To ->
-    {PendingRequests, To};
+do_commit_entries(From, To, _Log) when From > To ->
+    To;
 
-do_commit_entries(From, To, Log, PendingRequests) ->
+do_commit_entries(From, To, Log) ->
     % send replies if FSM is waiting
-    {Handled, NewPendingRequests} = acknowledge_request(From, PendingRequests),
-    Result = if 
-        Handled -> % reply sent, do nothing
-            ok;
-        true -> % issue commit on FSM otherwise
-            commit_entry(From, nth_log_entry(From, Log))
-    end,
+    Result = commit_entry(From, nth_log_entry(From, Log)),
     case Result of 
         ok ->
     % commit next index
-            do_commit_entries(From+1, To, Log, NewPendingRequests);
+            do_commit_entries(From+1, To, Log);
         {error, FsmIndex} ->
             if 
                 FsmIndex =< To -> % FSM is either more updated or outdated
                     % send all missing entries
-                    do_commit_entries(FsmIndex+1, To, Log, NewPendingRequests);
+                    do_commit_entries(FsmIndex+1, To, Log);
                 true -> 
                     % FSM is more updated than RAFT, wtf?
                     logger:warning("(do_commit_entries) FSM more updated than"
                                     " RAFT", []),
-                    {NewPendingRequests, From-1}
+                    From-1
             end
     end.
 
 %%--------------------------------------------------------------------
 
 % send a commit_entry RPC to FSM
-commit_entry(Index, #log_entry{content=Entry}) ->
+commit_entry(Index, #log_entry{term=Term, content=Entry}) ->
     logger:info("(commit_entry) ~p (~p)~n", [Index, Entry]),
-    ?FSM_MODULE:commit_entry(Index, Entry).
-
-%%--------------------------------------------------------------------
-
-% reply to pending FSM add_entry RPCs.
-acknowledge_request(CommitIndex, Requests) -> 
-    acknowledge_request(CommitIndex, Requests, [], false).
-
-%%--------------------------------------------------------------------
-
-% Reply to pending FSM add_entry RPCs (internal).
-% Check all pending requests and reply if index == commit_index.
-
-acknowledge_request(_CommitIndex, [], NewPendingRequests, Handled) -> 
-    {Handled, NewPendingRequests};
-    
-acknowledge_request(CommitIndex, [{Node, Index} | TRequests], 
-                    NewPendingRequests, _Handled) 
-when Index == CommitIndex -> % reply
-    logger:debug("(acknowledge_request) node=~p, index=~p~n", [Node, Index]),
-    gen_statem:reply(Node, {ok, CommitIndex}),
-    % remove this item from list, set handled to true
-    acknowledge_request(CommitIndex, TRequests, NewPendingRequests, true); 
-
-acknowledge_request(CommitIndex, [HRequest | TRequests], NewPendingRequests, 
-                    Handled) -> % no reply
-    % pass list as is, handled as is
-    acknowledge_request(CommitIndex, TRequests, 
-                        [HRequest | NewPendingRequests], Handled).
+    ?FSM_MODULE:commit_entry(Index, Term, Entry).
 
 %%--------------------------------------------------------------------
 %% Log-related functions

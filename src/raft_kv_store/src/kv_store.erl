@@ -6,16 +6,17 @@
 -export([init/1, handle_call/3, handle_cast/2]).
 
 % RAFT API
--export([commit_entry/2]).
+-export([commit_entry/3]).
 
 % Client API
 -export([get/1, get_all/0, set/2, delete/1, delete_all/0]).
 
+-include("kv_store_config.hrl").
 
 %%% RAFT API %%%
-commit_entry(Index, Entry) ->
+commit_entry(Index, Term, Entry) ->
     logger:notice("(commit_entry) ~p~n", [Entry]),
-    gen_server:call(?MODULE, {sync, Entry, Index}, infinity).
+    gen_server:call(?MODULE, {sync, Entry, {Index, Term}}, infinity).
 
 %%% Client API %%%
 get(Key) ->
@@ -44,42 +45,56 @@ start_link() ->
     gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
 
 init(_Args) ->
-    { ok, { 0, dict:new() } }.
+    { ok, { 0, dict:new(), dict:new()} }.
 
-add_raft_entry({ Operation, _ } = Action)
+add_raft_entry(Node, { Operation, _ } = Action)
     when ( Operation == set ) or ( Operation == delete ) or ( Operation == delete_all ) ->
-        raft_core:add_entry(Action);
+        raft_core:add_entry(Node, Action);
 
-add_raft_entry(_) -> { ok, no_state_change }.
+add_raft_entry(Node, _) -> 
+    NodeSelf = node(self()),
+    if 
+        Node == NodeSelf -> % reply locally
+            { ok, no_state_change, false };
+        true ->
+            { ok, no_state_change, ?STRONGLY_CONSISTENT }
+    end.
+            
 
-handle_call({execute, Action}, _From, {_, Dict} = State) ->
+handle_call({execute, Action}, From, {Index, Dict, PendingRequests} = State) ->
     Leader = raft_core:get_leader(),
-    Node = node(self()),
     case Leader of
-        Node ->
-            case add_raft_entry(Action) of
-                { ok, no_state_change } ->
-                    {Result, _} = handle_action(Action, Dict),
-                    {reply, Result, State};
-                { ok, NewIndex} ->
-                    {Result, NewDict} = handle_action(Action, Dict),
-                    {reply, Result, {NewIndex, NewDict}};
-                _ -> {reply, error, State}
-            end;
         null ->
             {reply, {error, leader_not_connected}, State};
         _ ->
-            Reply = gen_server:call({ kv_store, Leader}, Action),
-            {reply, Reply, State}
+            case add_raft_entry(Leader, Action) of
+                { ok, no_state_change, false } -> % handle get locally
+                    {Result, _} = handle_action(Action, Dict),
+                    {reply, Result, State};
+                { ok, no_state_change, true } -> 
+                    % stronger consistency, have leader reply
+                    Result = gen_server:call({?MODULE, Leader},
+                                             {execute, Action}),
+                    {reply, Result, State};
+                { ok, RaftRef} ->
+                    % enqueue request, waiting for its commit on local kv store
+                    NewPendingRequests = dict:store(RaftRef, From,
+                                                     PendingRequests),
+                    {noreply, {Index, Dict, NewPendingRequests}};
+                _ -> 
+                    {reply, error, State}
+            end
     end;
 
-handle_call({sync, _, NewIndex}, _From, {Index, _} = State)
+handle_call({sync, _, {NewIndex, _}}, _From, {Index, _, _} = State)
     when ( NewIndex =/= Index + 1 ) ->
         {reply, { error, Index }, State };
 
-handle_call({sync, Action, NewIndex}, _From, {_, Dict}) ->
-        {_, NewDict} = handle_action(Action, Dict),
-        {reply, ok, {NewIndex, NewDict}};
+handle_call({sync, Action, {NewIndex, _}=RaftRef}, _From, 
+            {_, Dict, PendingRequests}) ->
+    {_, NewDict} = handle_action(Action, Dict),
+    NewPendingRequests = reply_clients(RaftRef, PendingRequests),
+    {reply, ok, {NewIndex, NewDict, NewPendingRequests}};
 
 
 handle_call(Action, From, State) ->
@@ -117,3 +132,12 @@ handle_action({delete_all, { } }, _) ->
 
 handle_cast(_, State) ->
     {noreply, State}.
+
+reply_clients(RaftRef, PendingRequests) ->
+    case dict:find(RaftRef, PendingRequests) of
+        {ok, From} ->
+            gen_server:reply(From, ok),
+            dict:erase(RaftRef, PendingRequests);
+        error ->   
+            PendingRequests
+    end.

@@ -1,0 +1,1 @@
+-define(STRONGLY_CONSISTENT, false).
