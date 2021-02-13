@@ -687,9 +687,9 @@ handle_common(State, {call, From}, get_leader, #state{leader=Leader}) ->
     keep_state_and_data;
 
 % reply that this node is not the leader
-handle_common(State, {call, From}, {add_entry, _}, _State) ->
+handle_common(State, {call, From}, {add_entry, _}, #state{leader=Leader}) ->
     logger:debug("~p: add_entry: not a leader~n", [State]),
-    gen_statem:reply(From, false),
+    gen_statem:reply(From, {error, Leader}),
     keep_state_and_data;
 
 % any other cast action must be ignored
