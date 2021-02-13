@@ -307,9 +307,11 @@ callback_mode() ->
 
 % follower received no communication within election timeout, thus it 
 % becomes a candidate and starts a new election.
-follower(state_timeout, electionTimeout, #state{}=State) ->
+follower(state_timeout, electionTimeout, #state{
+    current_term=CurrentTerm
+}=State) ->
     logger:debug("follower: electionTimeout~n", []),
-    {next_state, candidate, State,
+    {next_state, candidate, State#state{current_term=CurrentTerm+1},
         % election is started immediately after becoming candidate (timeout=0)
         [{state_timeout, 0, electionTimeout}]
     };
@@ -453,13 +455,12 @@ candidate(state_timeout, electionTimeout, #state{
 }=State) ->
     logger:info("candidate: starting election~n", []),
     NewState = State#state{
-        current_term=CurrentTerm+1, % TODO check
         voted_for=node(self()),
         votes_for=sets:from_list([node(self())])
     },
     {LastLogIndex, LastLogTerm} = last_log_index_term(Log),
     % request votes from all other nodes
-    request_votes(Nodes, CurrentTerm+1, node(self()), 
+    request_votes(Nodes, CurrentTerm, node(self()), 
                   LastLogIndex, LastLogTerm),
     persist_state(NewState),
     % start a new election timeout
