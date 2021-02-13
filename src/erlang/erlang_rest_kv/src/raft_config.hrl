@@ -1,5 +1,0 @@
--define(ELECTION_TIMEOUT_MIN, 250).
--define(ELECTION_TIMEOUT_MAX, 500).
--define(HEART_BEAT_TIMEOUT, 100).
--define(NODES, [node1@honeypot, node2@honeypot, erlang_rest_kv@honeypot]).
--define(FSM_MODULE, kv_store).

@@ -19,7 +19,7 @@ start(_Type, _Args) ->
 	{ok, _} = cowboy:start_clear(http, [{port, 8080}], #{
 		env => #{dispatch => Dispatch}
 	}),
-	raft_statem:start(),
+	raft_core:start(),
 	erlang_rest_kv_sup:start_link().
 
 

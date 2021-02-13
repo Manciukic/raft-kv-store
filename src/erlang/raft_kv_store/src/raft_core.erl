@@ -7,7 +7,7 @@
 %%% @end
 %%%-------------------------------------------------------------------
 
--module(raft_statem).
+-module(raft_core).
 
 -behaviour(gen_statem).
 

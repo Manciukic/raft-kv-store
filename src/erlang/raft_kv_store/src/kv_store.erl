@@ -48,12 +48,12 @@ init(_Args) ->
 
 add_raft_entry({ Operation, _ } = Action)
     when ( Operation == set ) or ( Operation == delete ) or ( Operation == delete_all ) ->
-        raft_statem:add_entry(Action);
+        raft_core:add_entry(Action);
 
 add_raft_entry(_) -> { ok, no_state_change }.
 
 handle_call({execute, Action}, _From, {_, Dict} = State) ->
-    Leader = raft_statem:get_leader(),
+    Leader = raft_core:get_leader(),
     Node = node(self()),
     case Leader of
         Node ->
