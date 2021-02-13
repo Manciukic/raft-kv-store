@@ -46,7 +46,6 @@
 -record(state, {
     % Persistent state on all servers
     % (Updated on stable storage before responding to RPCs)
-    % TODO persist this data :D
 
     % latest term server has seen 
     % (initialized to 0 on first boot, increases monotonically)
@@ -75,6 +74,12 @@
     % list of all other nodes
     % (initialized at the beginning from configuration, removing local node)
     nodes,
+
+    % path to the file containing the log
+    log_file,
+
+    % path to the file containing the rest of the persisted state
+    pers_state_file,
 
     % Volatile state on leaders 
     % (reinitialized after election)
@@ -238,12 +243,18 @@ stop() ->
 %% @end
 %%--------------------------------------------------------------------
 init([]) ->
-    % TODO load persisted data from disk
+    FileSuffix = string:replace(atom_to_list(node()), "@", "_") ++ ".dat",
+    LogFile = "log_" ++ FileSuffix,
+    Log = read_terms(LogFile),
+    PersStateFile = "persisted_state_" ++ FileSuffix,
+    {CurrentTerm, VotedFor} = read_persisted_state(PersStateFile),
 
     {ok, follower, #state{
-        current_term=0, 
-        voted_for=null, 
-        log=[], 
+        log_file=LogFile,
+        pers_state_file=PersStateFile,
+        current_term=CurrentTerm, 
+        voted_for=VotedFor, 
+        log=Log, 
         commit_index=0, 
         last_applied=0, 
         next_index=maps:new(),
@@ -331,8 +342,10 @@ when PrevLogIndex > length(Log) ->
     logger:debug("follower: append_entries: prev_log_index not in log (~p)~n", 
                 [PrevLogIndex]),
     reply_append_entries(From, Term, false, length(Log)),
+    NewState = State#state{current_term=Term},
+    persist_state(NewState),
     % reset the election timeout
-    {keep_state, State#state{current_term=Term}, 
+    {keep_state, NewState, 
         [{state_timeout, rand_election_timeout(), electionTimeout}]};
 
 % reply false if log doesn't contain an entry at prev_log_index whose
@@ -358,6 +371,7 @@ follower(cast, {append_entries, From, #append_entries_req{
             reply_append_entries(From, Term, true, length(NewLog)),
             NewState2
     end,
+    persist_state(NewState),
     % reset the election timeout
     {keep_state, NewState, 
         [{state_timeout, rand_election_timeout(), electionTimeout}]};
@@ -403,8 +417,11 @@ when (VotedFor == null) or (VotedFor == CandidateId) ->
             reply_request_vote(From, CurrentTerm, false),
             State
     end,
-    % update current term and reset election timeout
-    {keep_state, NewState#state{current_term=max(CurrentTerm,Term)},
+    % update current term
+    NewState2 = NewState#state{current_term=max(CurrentTerm,Term)},
+    persist_state(NewState2),
+    % reset election timeout
+    {keep_state, NewState2,
         [{state_timeout, rand_election_timeout(), electionTimeout}]};
   
 % already voted, deny vote
@@ -444,6 +461,7 @@ candidate(state_timeout, electionTimeout, #state{
     % request votes from all other nodes
     request_votes(Nodes, CurrentTerm+1, node(self()), 
                   LastLogIndex, LastLogTerm),
+    persist_state(NewState),
     % start a new election timeout
     {keep_state, NewState, 
         [{state_timeout, rand_election_timeout(), electionTimeout}]};
@@ -458,7 +476,9 @@ candidate(cast, {request_vote_rpy, _From, #request_vote_rpy{
     current_term=CurrentTerm
 }=State) when Term > CurrentTerm->
     logger:debug("candidate: request_vote_rpy: term is higher~n"),
-    {next_state, follower, State#state{current_term=Term},
+    NewState = State#state{current_term=Term, voted_for=null},
+    persist_state(NewState),
+    {next_state, follower, NewState,
         [{state_timeout, rand_election_timeout(), electionTimeout}]};
 
 % vote is in favour. If votes received from majority of servers, then
@@ -642,7 +662,8 @@ leader({call, From}, {add_entry, Entry}, #state{
     current_term=CurrentTerm
 }=State) ->
     logger:debug("leader: add_entry~n", []),
-    NewState=persist_entries([Entry], State),
+    NewLog=add_persist_log_entries(build_log_entries([Entry], CurrentTerm), State),
+    NewState=State#state{log=NewLog},
     send_all_append_entries(NewState),
     gen_statem:reply(From, {ok, {length(Log)+1, CurrentTerm}}),
     {keep_state, NewState, [
@@ -867,8 +888,8 @@ do_append_entries(#append_entries_req{
     leader_commit=LeaderCommit
 }, #state{
     commit_index=CommitIndex,
-    log=Log,
-    last_applied=LastApplied
+    last_applied=LastApplied,
+    log=Log
 }=State) ->
     case Entries of
         [] ->
@@ -878,7 +899,8 @@ do_append_entries(#append_entries_req{
                          [PrevLogIndex, length(Entries)])
     end,
     % build new log, overwriting any conflicting entry
-    NewLog = lists:sublist(Log, PrevLogIndex+1) ++ Entries,
+    NewLog = add_persist_log_entries(Entries, 
+                        State#state{log=drop_log_entries(PrevLogIndex, Log)}),
     % update commit index
     NewCommitIndex = if 
         LeaderCommit > CommitIndex ->
@@ -991,19 +1013,24 @@ commit_entry(Index, #log_entry{term=Term, content=Entry}) ->
 %% Log-related functions
 %%--------------------------------------------------------------------
 
+% Convert entry to log_entry format
+build_log_entries(Entries, Term) ->
+    [#log_entry{term=Term, content=Entry} || Entry <- Entries].
+
 % Save new entries in log and persist on disk
-% TODO: this is only done in leader, not in follower!
-persist_entries(Entries, #state{
-    log=Log,
-    current_term=CurrentTerm
-}=State) ->
-    NewLogEntries = [#log_entry{
-        term=CurrentTerm,
-        content=Entry
-    } || Entry <- Entries],
-    %TODO persist newly added entries
-    logger:debug("(persist_entries) adding ~p entries~n", [length(Entries)]),
-    State#state{log=Log ++ NewLogEntries}.
+add_persist_log_entries(Entries, #state{
+    log_file=LogFile,
+    log=Log
+}) ->
+    logger:debug("(add_persist_log_entries) adding ~p entries~n", [length(Entries)]),
+    NewLog=Log ++ Entries,
+    write_terms(LogFile, NewLog),
+    NewLog.
+
+% Drop all entries in log after Index
+drop_log_entries(Index, Log) ->
+    logger:debug("(drop_log_entries) dropping entries after ~p ~n", [Index]),
+    lists:sublist(Log, Index).
 
 %%--------------------------------------------------------------------
 
@@ -1057,6 +1084,51 @@ log_sublist(Log, 0) ->
 
 log_sublist(Log, From) ->
     lists:sublist(Log, From, length(Log)).
+
+%%--------------------------------------------------------------------
+%% IO functions
+%%--------------------------------------------------------------------
+
+% write list of terms to file
+write_terms(Filename, List) ->
+    Format = fun(Term) -> io_lib:format("~tp.~n", [Term]) end,
+    Text = unicode:characters_to_binary(lists:map(Format, List)),
+    file:write_file(Filename, Text).
+
+%%--------------------------------------------------------------------
+
+% read list of terms from file
+read_terms(Filename) ->
+    case file:consult(Filename) of 
+        {ok, Terms} ->
+            Terms;
+        {error, _} ->
+            []
+    end.
+
+%%--------------------------------------------------------------------
+
+% persist state
+persist_state(#state{
+    current_term=CurrentTerm,
+    voted_for=VotedFor,
+    pers_state_file = PersStateFile
+}) ->
+    write_terms(PersStateFile, [{CurrentTerm, VotedFor}]).
+
+%%--------------------------------------------------------------------
+
+% read persisted state
+read_persisted_state(PersStateFile) ->
+    case read_terms(PersStateFile) of
+        [] ->
+            {0, null};
+        [Tuple] ->
+            Tuple;
+        Other ->
+            logger:error("Wrong persisted state file format: ~p~n", [Other]),
+            {0, null}
+    end.
 
 %%--------------------------------------------------------------------
 %% Misc functions
