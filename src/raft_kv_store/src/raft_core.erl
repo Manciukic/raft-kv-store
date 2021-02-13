@@ -42,7 +42,6 @@
 -define(SERVER, ?MODULE).
 
 % data held between states
-% TODO: use different records for each state to save memory ?
 -record(state, {
     % Persistent state on all servers
     % (Updated on stable storage before responding to RPCs)
@@ -54,15 +53,15 @@
     % candidate_id that received vote in current term or null if none)
     voted_for, 
 
+    % index of highest log entry known to be committed (initialized to 0, 
+    % increases monotonically)
+    commit_index, 
+
     % log entries; each entry contains command for state machine, and term 
     % when entry was received by leader (first index is 1)
     log, 
 
     % Volatile state on all server
-
-    % index of highest log entry known to be committed (initialized to 0, 
-    % increases monotonically)
-    commit_index, 
 
     % index of highest log entry applied to state machine 
     % (initialized to 0, increases monotonically)
@@ -247,7 +246,7 @@ init([]) ->
     LogFile = "log_" ++ FileSuffix,
     Log = read_terms(LogFile),
     PersStateFile = "persisted_state_" ++ FileSuffix,
-    {CurrentTerm, VotedFor} = read_persisted_state(PersStateFile),
+    {CurrentTerm, VotedFor, CommitIndex} = read_persisted_state(PersStateFile),
 
     {ok, follower, #state{
         log_file=LogFile,
@@ -255,7 +254,7 @@ init([]) ->
         current_term=CurrentTerm, 
         voted_for=VotedFor, 
         log=Log, 
-        commit_index=0, 
+        commit_index=CommitIndex, 
         last_applied=0, 
         next_index=maps:new(),
         match_index=maps:new(),
@@ -400,7 +399,7 @@ when Term < CurrentTerm ->
     logger:debug("follower: request_vote: wrong term~n", []),
     reply_request_vote(From, CurrentTerm, false),
     keep_state_and_data;
-      
+
 % update state if term is higher and then handle event
 follower(cast, {request_vote, _From, #request_vote_req{
     term = Term
@@ -637,12 +636,18 @@ when Success ->
     % if so, do those commits
     NewLastApplied = do_commit_entries(LastApplied+1, 
                                             NewCommitIndex, Log),
-    {keep_state, State#state{
+    NewState = State#state{
         next_index=NewNextIndexMap,
         match_index=NewMatchIndexMap,
         commit_index=NewCommitIndex,
         last_applied=NewLastApplied
-    }};
+    },
+    {keep_state, if 
+        NewCommitIndex > CommitIndex ->
+            persist_state(NewState);
+        true -> 
+            NewState
+    end};
 
 % append_entries failed, decrease next_index if possible and retry 
 leader(cast, {append_entries_rpy, From, _Req}, 
@@ -930,24 +935,25 @@ do_append_entries(#append_entries_req{
     NewLog = add_persist_log_entries(Entries, 
                         State#state{log=drop_log_entries(PrevLogIndex, Log)}),
     % update commit index
-    NewCommitIndex = if 
-        LeaderCommit > CommitIndex ->
-            min(LeaderCommit, length(NewLog));
-        true ->
-            CommitIndex
-    end,
+    NewCommitIndex = min(length(NewLog), max(LeaderCommit, CommitIndex)),
     logger:debug("(do_append_entries) committing entries from ~p to ~p~n",
         [LastApplied+1, NewCommitIndex]),
     logger:debug("(do_append_entries) log=~p~n", [NewLog]),
     NewLastApplied = do_commit_entries(LastApplied+1, NewCommitIndex, 
                         NewLog),
-    State#state{
+    NewState = State#state{
         leader=Leader,
         commit_index=NewCommitIndex,
         log=NewLog,
         current_term=Term,
         last_applied=NewLastApplied
-    }.
+    },
+    if 
+        NewCommitIndex > CommitIndex ->
+            persist_state(NewState);
+        true ->
+            NewState
+    end.
 
 %%--------------------------------------------------------------------
 
@@ -1140,9 +1146,11 @@ read_terms(Filename) ->
 persist_state(#state{
     current_term=CurrentTerm,
     voted_for=VotedFor,
+    commit_index=CommitIndex,
     pers_state_file = PersStateFile
-}) ->
-    write_terms(PersStateFile, [{CurrentTerm, VotedFor}]).
+}=State) ->
+    write_terms(PersStateFile, [{CurrentTerm, VotedFor, CommitIndex}]),
+    State.
 
 %%--------------------------------------------------------------------
 
@@ -1150,12 +1158,12 @@ persist_state(#state{
 read_persisted_state(PersStateFile) ->
     case read_terms(PersStateFile) of
         [] ->
-            {0, null};
-        [Tuple] ->
+            {0, null, 0};
+        [{_CurrentTerm, _VotedFor, _CommitIndex}=Tuple] ->
             Tuple;
         Other ->
             logger:error("Wrong persisted state file format: ~p~n", [Other]),
-            {0, null}
+            {0, null, 0}
     end.
 
 %%--------------------------------------------------------------------
