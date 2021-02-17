@@ -49,7 +49,7 @@ public class KVStoreBean implements KeyValueStore {
         //blocking receive operation
         OtpErlangObject msg = null;
         try {
-            msg = mbox.receive();
+            msg = mbox.receive(5000);
         } catch (OtpErlangExit otpErlangExit) {
             otpErlangExit.printStackTrace();
             return null;
@@ -77,7 +77,7 @@ public class KVStoreBean implements KeyValueStore {
         //blocking receive operation
         OtpErlangObject msg = null;
         try {
-            msg = mbox.receive();
+            msg = mbox.receive(5000);
         } catch (OtpErlangExit otpErlangExit) {
             otpErlangExit.printStackTrace();
             return null;
@@ -113,7 +113,7 @@ public class KVStoreBean implements KeyValueStore {
         //blocking receive operation
         OtpErlangObject msg = null;
         try {
-            msg = mbox.receive();
+            msg = mbox.receive(5000);
         } catch (OtpErlangExit otpErlangExit) {
             otpErlangExit.printStackTrace();
             return false;
@@ -141,7 +141,7 @@ public class KVStoreBean implements KeyValueStore {
         //blocking receive operation
         OtpErlangObject msg = null;
         try {
-            msg = mbox.receive();
+            msg = mbox.receive(5000);
         } catch (OtpErlangExit otpErlangExit) {
             otpErlangExit.printStackTrace();
         } catch (OtpErlangDecodeException e) {
@@ -168,7 +168,7 @@ public class KVStoreBean implements KeyValueStore {
         //blocking receive operation
         OtpErlangObject msg = null;
         try {
-            msg = mbox.receive();
+            msg = mbox.receive(5000);
         } catch (OtpErlangExit otpErlangExit) {
             otpErlangExit.printStackTrace();
         } catch (OtpErlangDecodeException e) {
