@@ -1,0 +1,17 @@
+package org.example;
+
+import com.ericsson.otp.erlang.OtpErlangDecodeException;
+import com.ericsson.otp.erlang.OtpErlangExit;
+
+import java.util.Collection;
+import java.util.List;
+import java.util.Map;
+
+public interface KeyValueStore {
+        String get(String key) throws OtpErlangExit, OtpErlangDecodeException;
+        List<String> getAll() throws OtpErlangExit, OtpErlangDecodeException;
+        boolean set(String key, String values) throws OtpErlangExit, OtpErlangDecodeException;
+        boolean delete(String key);
+        boolean deleteAll();
+    }
+}
