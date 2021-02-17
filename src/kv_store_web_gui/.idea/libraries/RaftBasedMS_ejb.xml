@@ -1,0 +1,9 @@
+<component name="libraryTable">
+  <library name="RaftBasedMS_ejb">
+    <CLASSES>
+      <root url="jar://$PROJECT_DIR$/RaftBasedMS/out/artifacts/RaftBasedMS_ejb/RaftBasedMS_ejb.jar!/" />
+    </CLASSES>
+    <JAVADOC />
+    <SOURCES />
+  </library>
+</component>

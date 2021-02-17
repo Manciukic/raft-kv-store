@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="ProjectModuleManager">
+    <modules>
+      <module fileurl="file://$PROJECT_DIR$/KeyValueStoreEJB/KeyValueStoreEJB.iml" filepath="$PROJECT_DIR$/KeyValueStoreEJB/KeyValueStoreEJB.iml" />
+      <module fileurl="file://$PROJECT_DIR$/KeyValueStoreInterface/KeyValueStoreInterface.iml" filepath="$PROJECT_DIR$/KeyValueStoreInterface/KeyValueStoreInterface.iml" />
+      <module fileurl="file://$PROJECT_DIR$/RaftBasedMS/RaftBasedMS.iml" filepath="$PROJECT_DIR$/RaftBasedMS/RaftBasedMS.iml" />
+      <module fileurl="file://$PROJECT_DIR$/kv_store_web_gui.iml" filepath="$PROJECT_DIR$/kv_store_web_gui.iml" />
+    </modules>
+  </component>
+</project>

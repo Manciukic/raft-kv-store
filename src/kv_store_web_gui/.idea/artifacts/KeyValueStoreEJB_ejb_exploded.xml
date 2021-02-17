@@ -1,0 +1,9 @@
+<component name="ArtifactManager">
+  <artifact type="exploded-ejb" name="KeyValueStoreEJB:ejb exploded">
+    <output-path>$PROJECT_DIR$/out/artifacts/KeyValueStoreEJB_ejb_exploded</output-path>
+    <root id="root">
+      <element id="module-output" name="KeyValueStoreEJB" />
+      <element id="javaee-facet-resources" facet="KeyValueStoreEJB/ejb/EJB" />
+    </root>
+  </artifact>
+</component>
