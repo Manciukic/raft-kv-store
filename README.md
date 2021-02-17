@@ -6,6 +6,11 @@ _Distributed Systems and Middleware Technologies_ @ University of Pisa.
 The goal of the project is to implement a distributed and strongly 
 consistent in-memory key-value store using the RAFT algorithm for consensus.
 
+## Dependencies
+ - Erlang OTP 23
+ - Java 8
+ - Glassfish 5.1.0
+
 ## Authors
  - Ahmed Abdulwahed
  - Mohamed Kaoula
