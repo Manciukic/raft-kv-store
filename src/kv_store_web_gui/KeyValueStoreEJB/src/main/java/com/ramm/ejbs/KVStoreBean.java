@@ -7,18 +7,31 @@ import javax.ejb.Stateless;
 import java.io.IOException;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.logging.Logger;
 
 @Stateless(name = "KVStoreEJB")
 public class KVStoreBean implements KeyValueStore {
-    private static final String serverNodeName = "node1@honeypot"; //configuration parameter
+    private Logger log = Logger.getLogger(KVStoreBean.class.getName());
+
+    //configuration parameters
+    private static final String[] availableServers = {"node1@honeypot", "node2@honeypot", "node3@honeypot"};
     private static final String serverRegisteredName = "kv_store"; //configuration parameter
-    private static final String clientNodeName = "jinterface@honeypot"; //configuration parameter
+    private static final String clientNodeNamePattern = "jinterface%d@honeypot"; //configuration parameter
     private static final String cookie="";
-    private OtpNode clientNode;  //initialized in constructor
+
+    // erlang constant values (initialized in constructor)
+    private final OtpNode clientNode;
     private final OtpMbox mbox;
+    private final String serverNodeName;
+
+    // unique id
+    private static final AtomicInteger counter = new AtomicInteger(0);
 
     //constructor
     public KVStoreBean() {
+        int myId = counter.getAndIncrement();
+        String clientNodeName = String.format(clientNodeNamePattern, myId);
         try {
             if (!cookie.equals("")) {
                 clientNode = new OtpNode(clientNodeName, cookie);
@@ -32,59 +45,75 @@ public class KVStoreBean implements KeyValueStore {
             throw new RuntimeException("IOException while creating new OTP Node", e);
         }
         mbox = clientNode.createMbox("client_mbox_");
-        System.out.println("Created mailbox "+ mbox.getName());
+        log.info("Created mailbox "+ mbox.getName());
 
+        serverNodeName = availableServers[myId % availableServers.length];
+    }
+
+    private OtpErlangObject genServerCall(String method, OtpErlangObject arguments){
+        OtpErlangObject ref = clientNode.createRef();
+
+        OtpErlangObject[] payload = new OtpErlangObject[2];
+        payload[0] = new OtpErlangAtom(method);
+        payload[1] = arguments;
+
+        OtpErlangObject[] tag = new OtpErlangObject[2];
+        tag[0] = mbox.self();
+        tag[1] = ref;
+
+        OtpErlangObject[] msg = new OtpErlangObject[3];
+        msg[0] = new OtpErlangAtom("$gen_call");
+        msg[1] = new OtpErlangTuple(tag);
+        msg[2] = new OtpErlangTuple(payload);
+
+        mbox.send(serverRegisteredName, serverNodeName, new OtpErlangTuple(msg));
+        log.info("Call " + method + " on " + serverRegisteredName + " at " + serverNodeName);
+        try {
+            OtpErlangObject recvRef;
+            OtpErlangObject recvPayload;
+            do {
+                OtpErlangObject reply = mbox.receive(5000);
+                if (reply == null)
+                    return null;
+                log.info(reply.toString());
+                OtpErlangTuple tupleReply = (OtpErlangTuple) reply;
+                recvRef = tupleReply.elementAt(0);
+                recvPayload = tupleReply.elementAt(1);
+            } while (!ref.equals(recvRef)); // ignore replies to other requests
+
+            return recvPayload;
+        } catch (OtpErlangExit otpErlangExit) {
+            otpErlangExit.printStackTrace();
+            return null;
+        } catch (OtpErlangDecodeException e) {
+            e.printStackTrace();
+            return null;
+        }
     }
 
     @Override
     public String get(String key) {
 
-        OtpErlangString Erlkey = new OtpErlangString(key);
-        OtpErlangString get = new OtpErlangString("get");
-        OtpErlangTuple arg = new OtpErlangTuple(Erlkey);
-        OtpErlangTuple reqMsg = new OtpErlangTuple(new OtpErlangObject[]{this.mbox.self(), get,arg});
+        OtpErlangString erlKey = new OtpErlangString(key);
+        OtpErlangTuple req = new OtpErlangTuple(new OtpErlangObject[]{erlKey});
 
-        //sending out the request
-        mbox.send(serverRegisteredName, serverNodeName, reqMsg);
-        //blocking receive operation
-        OtpErlangObject msg = null;
-        try {
-            msg = mbox.receive(5000);
-        } catch (OtpErlangExit otpErlangExit) {
-            otpErlangExit.printStackTrace();
+        OtpErlangObject msg = genServerCall("get", req);
+        if (msg == null)
             return null;
-        } catch (OtpErlangDecodeException e) {
-            e.printStackTrace();
-            return null;
-        }
+
         //getting the message content
-        OtpErlangString ErlStr = (OtpErlangString) msg;//it is supposed to be a tuple...
-        String value=ErlStr.stringValue();
-
-        return value;
+        OtpErlangString ErlStr = (OtpErlangString) msg;//it is supposed to be a string...
+        return ErlStr.stringValue();
     }
 
     @Override
     public Map<String, String> getAll() {
+        OtpErlangTuple req = new OtpErlangTuple(new OtpErlangObject[]{});
 
-        OtpErlangString get = new OtpErlangString("get_all");
-
-        OtpErlangTuple Arg = new OtpErlangTuple(new OtpErlangObject[]{});
-        OtpErlangTuple reqMsg = new OtpErlangTuple(new OtpErlangObject[]{this.mbox.self(), get,Arg});
-
-        //sending out the request
-        mbox.send(serverRegisteredName, serverNodeName, reqMsg);
-        //blocking receive operation
-        OtpErlangObject msg = null;
-        try {
-            msg = mbox.receive(5000);
-        } catch (OtpErlangExit otpErlangExit) {
-            otpErlangExit.printStackTrace();
+        OtpErlangObject msg = genServerCall("get_all", req);
+        if (msg == null)
             return null;
-        } catch (OtpErlangDecodeException e) {
-            e.printStackTrace();
-            return null;
-        }
+
         //getting the message content
         OtpErlangList erlList = (OtpErlangList) msg;
         Map<String, String> values = new HashMap<String, String>();
@@ -99,28 +128,14 @@ public class KVStoreBean implements KeyValueStore {
 
     @Override
     public boolean set(String key, String value) {
+        OtpErlangString erlKey = new OtpErlangString(key);
+        OtpErlangString erlVal = new OtpErlangString(value);
+        OtpErlangTuple req = new OtpErlangTuple(new OtpErlangObject[]{erlKey,erlVal});
 
-        OtpErlangString Erlkey = new OtpErlangString(key);
-
-        OtpErlangString Erlval = new OtpErlangString(value);
-        OtpErlangTuple arg = new OtpErlangTuple(new OtpErlangObject[]{Erlkey,Erlval});
-        OtpErlangString set = new OtpErlangString("set");
-
-        OtpErlangTuple reqMsg = new OtpErlangTuple(new OtpErlangObject[]{this.mbox.self(), set,arg});
-
-        //sending out the request
-        mbox.send(serverRegisteredName, serverNodeName, reqMsg);
-        //blocking receive operation
-        OtpErlangObject msg = null;
-        try {
-            msg = mbox.receive(5000);
-        } catch (OtpErlangExit otpErlangExit) {
-            otpErlangExit.printStackTrace();
+        OtpErlangObject msg = genServerCall("set", req);
+        if (msg == null)
             return false;
-        } catch (OtpErlangDecodeException e) {
-            e.printStackTrace();
-            return false;
-        }
+
         //getting the message content
         OtpErlangAtom ErlStr = (OtpErlangAtom) msg;//it is supposed to be a tuple...
         if (ErlStr.atomValue().equals("ok"))
@@ -131,25 +146,16 @@ public class KVStoreBean implements KeyValueStore {
 
     @Override
     public boolean delete(String key) {
-        OtpErlangString Erlkey = new OtpErlangString(key);
-        OtpErlangString del = new OtpErlangString("delete");
+        OtpErlangString erlKey = new OtpErlangString(key);
+        OtpErlangTuple req = new OtpErlangTuple(new OtpErlangObject[]{erlKey});
 
-        OtpErlangTuple reqMsg = new OtpErlangTuple(new OtpErlangObject[]{this.mbox.self(), del,Erlkey});
+        OtpErlangObject msg = genServerCall("delete", req);
+        if (msg == null)
+            return false;
 
-        //sending out the request
-        mbox.send(serverRegisteredName, serverNodeName, reqMsg);
-        //blocking receive operation
-        OtpErlangObject msg = null;
-        try {
-            msg = mbox.receive(5000);
-        } catch (OtpErlangExit otpErlangExit) {
-            otpErlangExit.printStackTrace();
-        } catch (OtpErlangDecodeException e) {
-            e.printStackTrace();
-        }
         //getting the message content
-        OtpErlangAtom Erlresp = (OtpErlangAtom) msg;
-        if (Erlresp.atomValue().equals("ok"))
+        OtpErlangAtom erlReply = (OtpErlangAtom) msg;
+        if (erlReply.atomValue().equals("ok"))
             return true;
         else
             return false;
@@ -158,25 +164,15 @@ public class KVStoreBean implements KeyValueStore {
 
     @Override
     public boolean deleteAll() {
+        OtpErlangTuple req = new OtpErlangTuple(new OtpErlangObject[]{});
 
-        OtpErlangString del = new OtpErlangString("delete_all");
+        OtpErlangObject msg = genServerCall("delete_all", req);
+        if (msg == null)
+            return false;
 
-        OtpErlangTuple reqMsg = new OtpErlangTuple(new OtpErlangObject[]{this.mbox.self(), del,});
-
-        //sending out the request
-        mbox.send(serverRegisteredName, serverNodeName, reqMsg);
-        //blocking receive operation
-        OtpErlangObject msg = null;
-        try {
-            msg = mbox.receive(5000);
-        } catch (OtpErlangExit otpErlangExit) {
-            otpErlangExit.printStackTrace();
-        } catch (OtpErlangDecodeException e) {
-            e.printStackTrace();
-        }
         //getting the message content
-        OtpErlangAtom Erlresp = (OtpErlangAtom) msg;
-        if (Erlresp.atomValue().equals("ok"))
+        OtpErlangAtom erlReply = (OtpErlangAtom) msg;
+        if (erlReply.atomValue().equals("ok"))
             return true;
         else
             return false;
