@@ -16,7 +16,11 @@
 %%% RAFT API %%%
 commit_entry(Index, Term, Entry) ->
     logger:notice("(commit_entry) ~p~n", [Entry]),
-    gen_server:call(?MODULE, {sync, Entry, {Index, Term}}, infinity).
+    try 
+        gen_server:call(?MODULE, {sync, Entry, {Index, Term}}, ?COMMIT_ENTRY_TIMEOUT)
+    catch 
+        Error:Reason -> {error, {Error, Reason}} 
+    end.
 
 %%% Client API %%%
 get(Key) ->

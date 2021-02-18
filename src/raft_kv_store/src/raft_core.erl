@@ -1023,6 +1023,10 @@ do_commit_entries(From, To, Log) ->
         ok ->
     % commit next index
             do_commit_entries(From+1, To, Log);
+        {error, {Error, Reason}} ->
+            logger:warning("(do_commit_entries) timeout: ~p ~p~n", 
+                            [Error, Reason]),
+            From-1;
         {error, FsmIndex} ->
             if 
                 FsmIndex =< To -> % FSM is either more updated or outdated
@@ -1041,7 +1045,8 @@ do_commit_entries(From, To, Log) ->
 % send a commit_entry RPC to FSM
 commit_entry(Index, #log_entry{term=Term, content=Entry}) ->
     logger:info("(commit_entry) ~p (~p)~n", [Index, Entry]),
-    ?FSM_MODULE:commit_entry(Index, Term, Entry).
+    ?FSM_MODULE:commit_entry(Index, Term, Entry),
+    logger:info("(commit_entry) ~p (~p) done~n", [Index, Entry]).
 
 %%--------------------------------------------------------------------
 %% Log-related functions

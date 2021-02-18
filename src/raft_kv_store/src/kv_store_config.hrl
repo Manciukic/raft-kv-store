@@ -1,1 +1,2 @@
 -define(STRONGLY_CONSISTENT, false).
+-define(COMMIT_ENTRY_TIMEOUT, 100).
