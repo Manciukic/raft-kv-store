@@ -107,6 +107,11 @@
                             The value associated with the given key is: ${requestedValue}
                         </div>
                     </c:if>
+                    <c:if test="${empty requestedValue}">
+                        <div class="alert alert-danger" role="alert">
+                            Value not found
+                        </div>
+                    </c:if>
                 </div>
               </div>
           </div>
