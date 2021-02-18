@@ -48,11 +48,15 @@ public class KvStoreServlet extends HttpServlet {
     protected void doPost(HttpServletRequest request, HttpServletResponse response) throws IOException {
         JSONObject objectToSend = new JSONObject();
         if (request.getParameter("set") != null){
-            JSONObject receivedJSONObject = new JSONObject(request.getParameter(""));
+            String requestData = request.getReader().lines().collect(Collectors.joining());
+            JSONObject receivedJSONObject = new JSONObject(requestData);
+
             objectToSend = dataManager.set(receivedJSONObject);
         }
         else if (request.getParameter("delete") != null){
-            JSONObject receivedJSONObject = new JSONObject(request.getParameter(""));
+            String requestData = request.getReader().lines().collect(Collectors.joining());
+            JSONObject receivedJSONObject = new JSONObject(requestData);
+
             objectToSend = dataManager.delete(receivedJSONObject);
         }
         else if(request.getParameter("deleteAll")!=null){
