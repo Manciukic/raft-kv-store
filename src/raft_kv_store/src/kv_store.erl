@@ -53,7 +53,11 @@ init(_Args) ->
 
 add_raft_entry(Node, { Operation, _ } = Action)
     when ( Operation == set ) or ( Operation == delete ) or ( Operation == delete_all ) ->
-        raft_core:add_entry(Node, Action);
+        try
+            raft_core:add_entry(Node, Action)
+        catch 
+            Error:Reason -> {error, {Error, Reason}} 
+        end;
 
 add_raft_entry(Node, _) -> 
     NodeSelf = node(self()),
@@ -64,6 +68,14 @@ add_raft_entry(Node, _) ->
             { ok, no_state_change, ?STRONGLY_CONSISTENT }
     end.
             
+leader_call(Node, Action) ->
+    try
+        gen_server:call({?MODULE, Node},
+                        {execute, Action})
+    catch 
+        Error:Reason -> {error, {Error, Reason}} 
+    end.
+
 
 handle_call({execute, Action}, From, {Index, Dict, PendingRequests} = State) ->
     Leader = raft_core:get_leader(),
@@ -77,16 +89,17 @@ handle_call({execute, Action}, From, {Index, Dict, PendingRequests} = State) ->
                     {reply, Result, State};
                 { ok, no_state_change, true } -> 
                     % stronger consistency, have leader reply
-                    Result = gen_server:call({?MODULE, Leader},
-                                             {execute, Action}),
+                    Result = leader_call(Leader, Action),
                     {reply, Result, State};
                 { ok, RaftRef} ->
                     % enqueue request, waiting for its commit on local kv store
                     NewPendingRequests = dict:store(RaftRef, From,
                                                      PendingRequests),
                     {noreply, {Index, Dict, NewPendingRequests}};
+                {error, {Error, Reason}} -> 
+                    {reply, {error, {Error, Reason}}, State};
                 _ -> 
-                    {reply, error, State}
+                    {reply, {error, unknown}, State}
             end
     end;
 
