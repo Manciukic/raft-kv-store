@@ -131,7 +131,9 @@ public class KVStoreBean implements KeyValueStore {
 
         for (OtpErlangObject erlO : erlList) {
             OtpErlangTuple t = (OtpErlangTuple) erlO;
-            values.put(t.elementAt(0).toString(), t.elementAt(1).toString());
+            OtpErlangString key = (OtpErlangString) t.elementAt(0);
+            OtpErlangString value = (OtpErlangString) t.elementAt(1);
+            values.put(key.stringValue(), value.stringValue());
         }
         return values;
 
