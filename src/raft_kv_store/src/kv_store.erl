@@ -3,7 +3,7 @@
 
 
 -export([start_link/0]).
--export([init/1, handle_call/3, handle_cast/2]).
+-export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
 
 % RAFT API
 -export([commit_entry/3]).
@@ -81,7 +81,7 @@ handle_call({execute, Action}, From, {Index, Dict, PendingRequests} = State) ->
     Leader = raft_core:get_leader(),
     case Leader of
         null ->
-            {reply, {error, leader_not_connected}, State};
+            {reply, error, State};
         _ ->
             case add_raft_entry(Leader, Action) of
                 { ok, no_state_change, false } -> % handle get locally
@@ -96,10 +96,10 @@ handle_call({execute, Action}, From, {Index, Dict, PendingRequests} = State) ->
                     NewPendingRequests = dict:store(RaftRef, From,
                                                      PendingRequests),
                     {noreply, {Index, Dict, NewPendingRequests}};
-                {error, {Error, Reason}} -> 
-                    {reply, {error, {Error, Reason}}, State};
+                {error, _} -> 
+                    {reply, error, State};
                 _ -> 
-                    {reply, {error, unknown}, State}
+                    {reply, error, State}
             end
     end;
 
@@ -148,6 +148,11 @@ handle_action({delete_all, { } }, _) ->
     {ok, NewDict}.
 
 handle_cast(_, State) ->
+    {noreply, State}.
+
+
+handle_info(Info, State) ->
+    logger:notice("Received info: ~p~n", [Info]),
     {noreply, State}.
 
 reply_clients(RaftRef, PendingRequests) ->
