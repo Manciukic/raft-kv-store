@@ -3,7 +3,8 @@
     <output-path>$PROJECT_DIR$/out/artifacts/KeyValueStoreEJB_ejb_exploded</output-path>
     <root id="root">
       <element id="module-output" name="KeyValueStoreEJB" />
-      <element id="javaee-facet-resources" facet="KeyValueStoreEJB/ejb/EJB" />
+      <element id="module-output" name="KeyValueStoreInterface" />
+      <element id="extracted-dir" path="$MAVEN_REPOSITORY$/clojang/erlang-jinterface/1.10-1/erlang-jinterface-1.10-1.jar" path-in-jar="/" />
     </root>
   </artifact>
 </component>
