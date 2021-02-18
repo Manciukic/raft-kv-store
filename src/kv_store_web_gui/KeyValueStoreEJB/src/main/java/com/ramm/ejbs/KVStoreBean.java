@@ -102,6 +102,16 @@ public class KVStoreBean implements KeyValueStore {
         }
     }
 
+    private boolean success(OtpErlangObject msg){
+        if (msg instanceof OtpErlangAtom){
+            OtpErlangAtom msgAtom = (OtpErlangAtom) msg;
+            if (msgAtom.atomValue().equals("error")){
+                return false;
+            }
+        }
+        return true;
+    }
+
     @Override
     public String get(String key) {
 
@@ -109,7 +119,7 @@ public class KVStoreBean implements KeyValueStore {
         OtpErlangTuple req = new OtpErlangTuple(new OtpErlangObject[]{erlKey});
 
         OtpErlangObject msg = genServerCall("get", req);
-        if (msg == null)
+        if (msg == null || !success(msg))
             return null;
 
         //getting the message content
@@ -122,7 +132,7 @@ public class KVStoreBean implements KeyValueStore {
         OtpErlangTuple req = new OtpErlangTuple(new OtpErlangObject[]{});
 
         OtpErlangObject msg = genServerCall("get_all", req);
-        if (msg == null)
+        if (msg == null || !success(msg))
             return null;
 
         //getting the message content
@@ -146,7 +156,7 @@ public class KVStoreBean implements KeyValueStore {
         OtpErlangTuple req = new OtpErlangTuple(new OtpErlangObject[]{erlKey,erlVal});
 
         OtpErlangObject msg = genServerCall("set", req);
-        if (msg == null)
+        if (msg == null || !success(msg))
             return false;
 
         //getting the message content
@@ -163,7 +173,7 @@ public class KVStoreBean implements KeyValueStore {
         OtpErlangTuple req = new OtpErlangTuple(new OtpErlangObject[]{erlKey});
 
         OtpErlangObject msg = genServerCall("delete", req);
-        if (msg == null)
+        if (msg == null || !success(msg))
             return false;
 
         //getting the message content
@@ -180,7 +190,7 @@ public class KVStoreBean implements KeyValueStore {
         OtpErlangTuple req = new OtpErlangTuple(new OtpErlangObject[]{});
 
         OtpErlangObject msg = genServerCall("delete_all", req);
-        if (msg == null)
+        if (msg == null || !success(msg))
             return false;
 
         //getting the message content
