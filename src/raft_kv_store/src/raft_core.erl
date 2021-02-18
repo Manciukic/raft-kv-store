@@ -677,14 +677,13 @@ leader(cast, {append_entries_rpy, From, _Req},
 
 % add the new entry to the log and send append entries to all other nodes
 leader({call, From}, {add_entry, Entry}, #state{
-    log=Log,
     current_term=CurrentTerm
 }=State) ->
     logger:debug("leader: add_entry~n", []),
     NewLog=add_persist_log_entries(build_log_entries([Entry], CurrentTerm), State),
     NewState=State#state{log=NewLog},
+    gen_statem:reply(From, {ok, last_log_index_term(NewLog)}),
     send_all_append_entries(NewState),
-    gen_statem:reply(From, {ok, {length(Log)+1, CurrentTerm}}),
     {keep_state, NewState, [
         % reset heartbeat timeout
         {state_timeout, ?HEART_BEAT_TIMEOUT, heartBeatTimeout}
