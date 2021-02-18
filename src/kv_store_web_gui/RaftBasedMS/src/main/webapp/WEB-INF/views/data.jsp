@@ -11,7 +11,7 @@
     <link href="resources/css/style.css" rel="stylesheet">
   </head>
   <body>
-      <%@include file="../../../../../target/RaftBasedMS-1.0-SNAPSHOT/WEB-INF/commons/header.jsp"%>
+      <%@include file="../commons/header.jsp"%>
       <main>
         <section>
           <div class="container mx-auto" style="width: 750px">
@@ -107,12 +107,17 @@
                             The value associated with the given key is: ${requestedValue}
                         </div>
                     </c:if>
+                    <c:if test="${empty requestedValue}">
+                        <div class="alert alert-danger" role="alert">
+                            Value not found
+                        </div>
+                    </c:if>
                 </div>
               </div>
           </div>
       </section>
       </main>
-      <%@include file="../../../../../target/RaftBasedMS-1.0-SNAPSHOT/WEB-INF/commons/footer.jsp"%>
+      <%@include file="../commons/footer.jsp"%>
   </body>
 <script>
   $(document).ready(function() {

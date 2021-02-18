@@ -1,0 +1,8 @@
+<component name="ArtifactManager">
+  <artifact type="ejb-jar" name="KeyValueStoreEJB:ejb">
+    <output-path>$PROJECT_DIR$/out/artifacts/KeyValueStoreEJB_ejb</output-path>
+    <root id="archive" name="KeyValueStoreEJB_ejb.jar">
+      <element id="artifact" artifact-name="KeyValueStoreEJB:ejb exploded" />
+    </root>
+  </artifact>
+</component>

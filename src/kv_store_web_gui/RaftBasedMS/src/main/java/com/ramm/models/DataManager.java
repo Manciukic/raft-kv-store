@@ -1,6 +1,7 @@
 package com.ramm.models;
 
 import com.ramm.interfaces.KeyValueStore;
+import org.apache.commons.text.StringEscapeUtils;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
@@ -18,17 +19,17 @@ public class DataManager {
     public String loadData(){
         Map<String, String> values= new HashMap<>();
         values = getAll();
-        Iterator it = values.entrySet().iterator();
+        Iterator<Map.Entry<String, String>> it = values.entrySet().iterator();
 
         String data = "";
         while(it.hasNext()) {
-            Map.Entry mapElement = (Map.Entry)it.next();
+            Map.Entry<String, String> mapElement = it.next();
             data += "<tr>" +
-                        "<td data-column=\"Key\">" + String.valueOf(mapElement.getKey()) + "</td>" +
-                        "<td data-column=\"Value\">" + String.valueOf(mapElement.getValue()) + "</td>" +
+                        "<td data-column=\"Key\">" + mapElement.getKey() + "</td>" +
+                        "<td data-column=\"Value\">" + mapElement.getValue() + "</td>" +
                         "<td data-column=\"Delete\">" +
                             "<form action='data' method='post'>" +
-                                "<input name=\"key\" value=\""+String.valueOf(mapElement.getKey())+"\" hidden>" +
+                                "<input name=\"key\" value=\""+ StringEscapeUtils.escapeHtml4(mapElement.getKey()) +"\" hidden>" +
                                 "<button name='delete' type=\"submit\" class=\"btn btn-danger\">Delete</button>" +
                             "</form>" +
                         "</td>" +
