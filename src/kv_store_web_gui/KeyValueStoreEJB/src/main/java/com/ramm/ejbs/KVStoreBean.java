@@ -5,6 +5,8 @@ import com.ramm.interfaces.KeyValueStore;
 
 import javax.ejb.Stateless;
 import java.io.IOException;
+import java.net.InetAddress;
+import java.net.UnknownHostException;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -15,10 +17,10 @@ public class KVStoreBean implements KeyValueStore {
     private Logger log = Logger.getLogger(KVStoreBean.class.getName());
 
     //configuration parameters
-    private static final String[] availableServers = {"node1@honeypot", "node2@honeypot", "node3@honeypot"};
+    private static final String serverNodeShortName = "raft";
     private static final String serverRegisteredName = "kv_store"; //configuration parameter
-    private static final String clientNodeNamePattern = "jinterface%d@honeypot"; //configuration parameter
-    private static final String cookie="";
+    private static final String clientNodeShortNamePattern = "jinterface%d"; //configuration parameter
+    private static final String cookie="raft";
 
     // erlang constant values (initialized in constructor)
     private final OtpNode clientNode;
@@ -31,7 +33,18 @@ public class KVStoreBean implements KeyValueStore {
     //constructor
     public KVStoreBean() {
         int myId = counter.getAndIncrement();
-        String clientNodeName = String.format(clientNodeNamePattern, myId);
+
+        String hostname;
+        try {
+            hostname = InetAddress.getLocalHost().getHostName();
+        } catch (UnknownHostException e) {
+            hostname = "localhost";
+        }
+
+        serverNodeName = serverNodeShortName + "@" + hostname;
+
+        String clientNodeShortName = String.format(clientNodeShortNamePattern, myId);
+        String clientNodeName = clientNodeShortName + "@" + hostname;
         try {
             if (!cookie.equals("")) {
                 clientNode = new OtpNode(clientNodeName, cookie);
@@ -46,8 +59,6 @@ public class KVStoreBean implements KeyValueStore {
         }
         mbox = clientNode.createMbox("client_mbox_");
         log.info("Created mailbox "+ mbox.getName());
-
-        serverNodeName = availableServers[myId % availableServers.length];
     }
 
     private OtpErlangObject genServerCall(String method, OtpErlangObject arguments){
